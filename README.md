@@ -3,8 +3,11 @@ Project about Training-Free Detection of AI-Generated Images with Performance Mo
 
 ## General description : 
 AI-generated images are increasingly hard to distinguish by eye, and the political and safety consequences pose significant risks to trust in digital media, elections, and public discourse. This topic studies training-free detection of AI-generated images using vision foundation models to improve our ability to detect synthetic content.
+
 **Paper 1.1:** Further improving training-free AI-generated image detection.
+
 **Link:** [Understanding and Improving Training-Free AI-Generated Image Detections with Vision Foundation Models](https://arxiv.org/abs/2411.19117)
+
 **How to reproduce :** You will be given a set of 1000 image pairs (real vs. fake). 
 Reproduce the key experiments as follows:
 1. Implement the baseline detector (RIGID) by extracting and computing the embedding similarity.

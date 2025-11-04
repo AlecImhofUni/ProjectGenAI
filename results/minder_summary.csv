@@ -1,0 +1,4 @@
+dataset,n,auroc,thr_at_fpr_0.05,fpr_on_cal_set,tpr_on_cal_set,model,sigma,sigma_blur,n_noise
+GLOBAL,2000,0.6778025000000001,,,,vit_base_patch14_dinov2.lvd142m,0.009,1.6,3
+AMD,1000,0.679064,,,,vit_base_patch14_dinov2.lvd142m,0.009,1.6,3
+CollabDiff,1000,0.684968,,,,vit_base_patch14_dinov2.lvd142m,0.009,1.6,3

@@ -30,7 +30,7 @@ Outputs (CSV)
     rigid_summary.csv   | GLOBAL + per-dataset AUROC (+ hyperparams)
     blur_scores.csv     | per-image (Blur)
     blur_summary.csv    | summary (Blur)
-    minder_scores.csv   | per-image (MINDER = min(Noise,Blur))
+    minder_scores.csv   | per-image (MINDER = max of Noise/Blur distances ≡ min of similarities)
     minder_summary.csv  | summary (MINDER)
 
 Key CLI flags
@@ -62,7 +62,7 @@ Typical runs
   # Noise (RIGID)
   python training_free_detect.py \
     --data_root ~/data/pairs_1000_eval \
-    --model dinov2-b14 \
+    --model dinov2-l14 \
     --batch_size 64 \
     --sigma 0.009 --n_noise 3 \
     --perturb noise \
@@ -71,19 +71,19 @@ Typical runs
   # Blur
   python training_free_detect.py \
     --data_root ~/data/pairs_1000_eval \
-    --model dinov2-b14 \
+    --model dinov2-l14 \
     --batch_size 64 \
-    --sigma_blur 1.6 \
+    --sigma_blur 0.55 \
     --perturb blur \
     --results_dir results
 
   # All three in one go: Noise, Blur, MINDER
   python training_free_detect.py \
     --data_root ~/data/pairs_1000_eval \
-    --model dinov2-b14 \
+    --model dinov2-l14 \
     --batch_size 64 \
     --sigma 0.009 --n_noise 3 \
-    --sigma_blur 1.6 \
+    --sigma_blur 0.55 \
     --perturb both \
     --results_dir results
 
@@ -267,19 +267,11 @@ def add_gaussian_noise_pixel(x_norm, sigma_pix, mean, std):
 
 # ------------------ Pixel-space perturbations ------------------
 
-def _kernel_size_for_sigma(sigma_pix: float, kmin: int = 3, kmax: int = 51) -> int:
-    # cover ~±3σ, ensure odd, clamp
-    k = int(2 * round(3 * sigma_pix) + 1)
-    k = max(kmin, min(k, kmax))
-    if k % 2 == 0:
-        k += 1
-    return k
-
 def gaussian_blur_pixel(x_norm: torch.Tensor, sigma_pix: float, mean, std, kernel_size: int | None = None):
     """
-    Blur in pixel space [0,1] then re-normalize.
+    Fixed 3×3 Gaussian blur in pixel space [0,1], then re-normalize.
     x_norm: [B,3,H,W] normalized (ImageNet)
-    sigma_pix: Gaussian std in *pixels* at current resolution (e.g., 0.8, 1.2, 1.6, 2.0)
+    sigma_pix: Gaussian std in pixels (default 0.55 matches paper).
     """
     if sigma_pix <= 0:
         return x_norm
@@ -288,20 +280,18 @@ def gaussian_blur_pixel(x_norm: torch.Tensor, sigma_pix: float, mean, std, kerne
     B, C, H, W = x_pix.shape
     device, dtype = x_pix.device, x_pix.dtype
 
-    k = _kernel_size_for_sigma(sigma_pix) if kernel_size is None else kernel_size
-    half = (k - 1) // 2
+    # Fixed 3×3 separable kernel
+    k = 3
+    half = 1
+    t = torch.tensor([-1.0, 0.0, 1.0], device=device, dtype=dtype)  # length-3 axis
+    g1d = torch.exp(-0.5 * (t / max(sigma_pix, 1e-6))**2)
+    g1d = g1d / g1d.sum()  # normalize to sum=1
 
-    # 1D Gaussian kernel (separable)
-    t = torch.linspace(-half, half, steps=k, device=device, dtype=dtype)
-    g1d = torch.exp(-0.5 * (t / sigma_pix) ** 2)
-    g1d = g1d / g1d.sum()                           # normalize
+    g_x = g1d.view(1, 1, 1, k).repeat(C, 1, 1, 1)   # (C,1,1,3)
+    g_y = g1d.view(1, 1, k, 1).repeat(C, 1, 1, 1)   # (C,1,3,1)
 
-    g_x = g1d.view(1, 1, 1, k).repeat(C, 1, 1, 1)   # (C,1,1,k)
-    g_y = g1d.view(1, 1, k, 1).repeat(C, 1, 1, 1)   # (C,1,k,1)
-
-    # reflect padding to avoid dark borders
-    pad = (half, half, half, half)
-    x_pad = F.pad(x_pix, pad, mode="reflect")
+    # reflect padding of 1 pixel
+    x_pad = F.pad(x_pix, (half, half, half, half), mode="reflect")
 
     # depthwise conv: groups=C
     out = F.conv2d(x_pad, g_x, groups=C)
@@ -350,9 +340,9 @@ def score_loader(model, loader, sigma=0.009, n_noise=3, device="cuda"):
     return scores, labels, all_paths, all_dsets
 
 @torch.no_grad()
-def score_loader_blur(model, loader, sigma_blur=1.6, device="cuda"):
+def score_loader_blur(model, loader, sigma_blur=0.55, device="cuda"):
     """
-    Compute RIGID-style scores with *Gaussian blur* (single pass per image):
+    Compute RIGID-style scores with *Gaussian blur* (single pass, fixed 3×3 kernel):
       - e0 = CLS clean
       - x_blur = gaussian_blur_pixel(x, sigma_blur) in [0,1], then re-normalize
       - distance = 1 - cosine(e0, e_blur)
@@ -490,7 +480,7 @@ def parse_args():
     ap = argparse.ArgumentParser("RIGID baseline (timm, noise-only, per-dataset AUROC, CSV to results/)")
     ap.add_argument("--data_root", default=None, type=str,
                     help="Folder with real/ and fake/ (required unless --minder_from_csv)")
-    ap.add_argument("--model", default="dinov2-b14", type=str,
+    ap.add_argument("--model", default="dinov2-l14", type=str,
                     help="timm model or alias: dinov2-b14 | dinov2-l14 | dinov2-g14 | "
                          "vit_base_patch14_dinov2.lvd142m, etc.")
     ap.add_argument("--batch_size", default=64, type=int)
@@ -504,11 +494,11 @@ def parse_args():
                     help="Calibrate threshold@FPR=5% on the SAME REAL set (optimistic).")
     ap.add_argument("--results_dir", default="results", type=str,
                     help="Directory to write CSV results (will be created if missing).")
-    ap.add_argument("--sigma_blur", default=1.6, type=float,
-                    help="Gaussian blur std in pixels (try 0.8–2.0).")    
-    ap.add_argument("--perturb", default="noise",
+    ap.add_argument("--sigma_blur", default=0.55, type=float,
+                    help="Gaussian blur σ (fixed 3×3 kernel in pixel space; default 0.55).")    
+    ap.add_argument("--perturb", default="both",
                     choices=["noise", "blur", "both", "minder"],
-                    help="Perturbation to use: noise | blur | both (noise+blur) | minder (min(noise,blur))")
+                    help="Perturbation to use: noise | blur | both (noise+blur [+minder]) | minder (max of noise/blur distances ≡ min of similarities))")
     ap.add_argument("--minder_from_csv", action="store_true",
                     help="Compute MINDER by merging existing rigid_scores.csv and blur_scores.csv (no recompute).")
     ap.add_argument("--rigid_csv", default="results/rigid_scores.csv", type=str)
@@ -586,10 +576,10 @@ def main():
         scores_b, _, _, _ = score_loader_blur(
             model, loader, sigma_blur=args.sigma_blur, device=args.device
         )
-        # MINDER = per-image min
+        # MINDER = per-image max(distance) ≡ min(similarity)
         scores = torch.minimum(scores_n, scores_b)
 
-        method_print = f"MINDER (min(noise,blur); sigma={args.sigma}, n_noise={args.n_noise}, sigma_blur={args.sigma_blur})"
+        method_print = f"MINDER (max(noise,blur) distances; sigma={args.sigma}, n_noise={args.n_noise}, sigma_blur={args.sigma_blur})"
 
         # Print metrics (global + per-dataset)
         roc_global = auroc(scores, labels)
@@ -653,7 +643,7 @@ def main():
         )
 
         # Finally: MINDER = min(noise, blur)
-        scores_m = torch.maximum(scores_n, scores_b)
+        scores_m = torch.minimum(scores_n, scores_b)
         roc_global = auroc(scores_m, labels)
         print(f"[RIGID] Global AUROC (MINDER) = {roc_global:.4f}")
         per_ds = per_dataset_auroc(scores_m, labels, datasets)

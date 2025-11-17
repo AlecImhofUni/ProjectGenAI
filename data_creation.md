@@ -43,15 +43,24 @@ gdown --fuzzy --folder "https://drive.google.com/drive/folders/1rLcdN-VctJpW4k9A
 gdown --fuzzy --folder "https://drive.google.com/drive/folders/13MdDea8eI8P4ygeIyfy8krlTb8Ty0mAP" -O pretrained
 
 ```
-Creation of fake images (script): gen_cd_fakes_gpu.sh
+Creation of fake images (script): `gen_cd_fakes_gpu.sh`
 ```bash
 bash ~/gen_cd_fakes_gpu.sh 500 8 10 "A portrait photo of a person."
 ```
 
 ### Create the set of 1000 image pairs (real vs. fake)
-Using the script: make_pairs.sh
+Using the script: `make_pairs.sh`
 ```bash
 TAKE_ADM=500 TAKE_CD=500 bash ~/make_pairs.sh
 ```
+
+### SID
+Download 2000 images using the python file: `sid_download.py`
+#### Create a set of 2000 image pairs (real vs. fake)
+Using the script: `make_pairs_sid.sh`
+```bash
+TAKE_SID=1000 bash ~/make_pairs_sid.sh
+```
+
 
 

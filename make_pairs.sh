@@ -64,8 +64,8 @@ ADM_FAKE="$ROOT/ADM/val/fake"
 CD_REAL="$ROOT/CollabDiff/real"
 CD_FAKE="$ROOT/CollabDiff/fake"
 
-TAKE_ADM="${TAKE_ADM:-$((TOTAL/2))}"    # (int) desired pairs from ADM
-TAKE_CD="${TAKE_CD:-$((TOTAL-TAKE_ADM))}" # (int) desired pairs from CollabDiff
+TAKE_ADM="${TAKE_ADM:-$((TOTAL/2))}"        # (int) desired pairs from ADM
+TAKE_CD="${TAKE_CD:-$((TOTAL-TAKE_ADM))}"   # (int) desired pairs from CollabDiff
 
 EVAL="$ROOT/pairs_${TOTAL}_eval"
 CSV="$EVAL/pairs_${TOTAL}.csv"
@@ -95,6 +95,7 @@ count_imgs() {
 # pick
 # ----
 # Pick K random image files from a directory and print their paths.
+# (Uses `shuf`, garanti présent dans ton environnement.)
 #
 # Args:
 #   $1 (str): Directory path.
@@ -104,17 +105,9 @@ count_imgs() {
 #   str: K lines, each a file path.
 #
 # Returns:
-#   0 on success. Non-zero if find/shuf/awk fails.
+#   0 on success. Non-zero if find/shuf/head fails.
 pick() { # $1=dir $2=K -> echo K random files
-  if command -v shuf >/dev/null 2>&1; then
-    # Fast path: use shuf if available.
-    find "$1" -type f -iregex '.*\.\(png\|jpg\|jpeg\)' | shuf | head -n "$2"
-  else
-    # Fallback: randomize via awk if shuf is missing.
-    find "$1" -type f -iregex '.*\.\(png\|jpg\|jpeg\)' \
-    | awk 'BEGIN{srand()} {printf "%f %s\n", rand(), $0}' \
-    | sort -n | cut -d" " -f2- | head -n "$2"
-  fi
+  find "$1" -type f -iregex '.*\.\(png\|jpg\|jpeg\)' | shuf | head -n "$2"
 }
 
 # mkpair
@@ -218,4 +211,4 @@ fi
 
 log "[OK] Eval split: $EVAL/{real,fake}"
 log "     CSV: $CSV"
-log "Counts: real=$(find "$EVAL/real" -type f | wc -l | tr -d ' ') fake=$(find "$EVAL/fake" -type f | wc -l | tr -d ' ')"
+log "     Counts: real=$(find "$EVAL/real" -type f | wc -l | tr -d ' ') fake=$(find "$EVAL/fake" -type f | wc -l | tr -d ' ')"

@@ -5,7 +5,7 @@ Computes global and per-dataset AUROC; writes per-image and summary CSVs to a de
 
 What this script does
 ---------------------
-- Loads a timm DINOv2 ViT (B/L/G) as a **feature extractor** (num_classes=0); returns L2-normalized CLS embeddings.
+- Loads a timm DINOv2 / DINOv3 ViT (B/L/G) as a **feature extractor** (num_classes=0); returns L2-normalized CLS embeddings.
 - Reads images from data_root/{real,fake} and resizes on-the-fly to 224×224 (Resize -> CenterCrop); no disk recompression.
 - Applies **pixel-space perturbations** on [0,1] images, then re-normalizes for the encoder:
     • **Noise (RIGID)**: add Gaussian noise σ ∈ [0,1] (repeat n_noise, average distance).
@@ -14,7 +14,7 @@ What this script does
 - Scores each image by **cosine distance**: 1 − cos(embedding_clean, embedding_perturbed).
   Higher score ⇒ more sensitive ⇒ more likely **fake**.
 - Reports **GLOBAL** AUROC and **per-dataset** AUROC (dataset parsed from filename or CSV tag).
-- (Optional) Calibrates a threshold at **FPR=5%** on the same REAL set (inspection only).
+- Exports per-image CSVs (path, label, score, dataset) and summary CSVs (GLOBAL + per-dataset AUROC).
 
 Folder layout (expected)
 ------------------------
@@ -52,56 +52,15 @@ CSV-only (no recompute) mode
   --blur_csv  <path>                Path to Blur  (blur_scores.csv)
   # In this mode, --data_root/--model are ignored.
 
-Dependencies
-------------
-  pip install timm torch torchvision scikit-learn pillow
-  (pandas is optional; a CSV fallback is used if pandas is missing)
-
-Typical runs
-------------
-  # Noise (RIGID)
-  python training_free_detect.py \
-    --data_root ~/data/pairs_1000_eval \
-    --model dinov2-l14 \
-    --batch_size 64 \
-    --sigma 0.009 --n_noise 3 \
-    --perturb noise \
-    --results_dir results
-
-  # Blur
-  python training_free_detect.py \
-    --data_root ~/data/pairs_1000_eval \
-    --model dinov2-l14 \
-    --batch_size 64 \
-    --sigma_blur 0.55 \
-    --perturb blur \
-    --results_dir results
-
-  # All three in one go: Noise, Blur, MINDER
-  python training_free_detect.py \
-    --data_root ~/data/pairs_1000_eval \
-    --model dinov2-l14 \
-    --batch_size 64 \
-    --sigma 0.009 --n_noise 3 \
-    --sigma_blur 0.55 \
-    --perturb both \
-    --results_dir results
-
-  # Compute MINDER from existing CSVs (no embedding recompute)
-  python training_free_detect.py \
-    --minder_from_csv \
-    --rigid_csv results/rigid_scores.csv \
-    --blur_csv  results/blur_scores.csv \
-    --results_dir results
 """
-
 
 import argparse
 import math
 import re
-import sys
 from collections import defaultdict
 from pathlib import Path
+import pandas as pd
+
 
 import torch
 import torch.nn.functional as F
@@ -111,6 +70,7 @@ import torchvision.transforms as T
 import timm
 from sklearn.metrics import roc_auc_score
 
+
 # ------------------ Constants & Config ------------------
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -119,47 +79,104 @@ IMG_SIZE = 224  # target resolution (paper-friendly; we force 224 here)
 
 # Friendly aliases -> timm names
 NAME_MAP = {
+    #DINOv2
     "dinov2-b14": "vit_base_patch14_dinov2.lvd142m",
     "dinov2-l14": "vit_large_patch14_dinov2.lvd142m",
     "dinov2-g14": "vit_giant_patch14_dinov2.lvd142m",
+
+    #DINOv3
+    "dinov3-s16": "vit_small_patch16_dinov3.lvd1689m",
+    "dinov3-l16": "vit_large_patch16_dinov3.lvd1689m",
+
 }
 
-# NEW: filenames are now like "pair_0001_AMD.jpg" or "pair_0002_CollabDiff.png"
+# filenames now like "pair_0001_ADM.jpg", "pair_0002_CollabDiff.png", "pair_0003_SID.jpeg"
 DATASET_REGEX = re.compile(r"^pair_\d+_([^_]+)$", re.IGNORECASE)
+
+def _normalize_tag(tag: str) -> str:
+    """
+    Normalize raw dataset tag strings to a canonical set.
+
+    Args:
+        tag (int): Raw dataset tag string.
+
+    Returns:
+        str: Original tag otherwise.
+    """
+    t = tag.strip()
+    if t.upper() in {"ADM"}:
+        return "ADM"
+    if t.lower().startswith("collab"):
+        return "CollabDiff"
+    if t.upper() == "SID":
+        return "SID"
+    return t
 
 def parse_dataset_from_path(path_str: str) -> str:
     """
-    Parse dataset name from filenames like:
-        pair_0001_AMD.jpg        -> "AMD"
-        pair_1000_CollabDiff.png -> "CollabDiff"
-    Fallback: last underscore token if regex doesn't match.
+    Infer the dataset name from a file path.
+
+    Priority:
+    1. Use the filename stem pattern:
+       - pair_0001_ADM / pair_0002_CollabDiff / pair_0003_SID
+    2. Fallback to directory names:
+       - "sid_dataset", "/authentic/", "/fully_synthetic/" → SID
+       - "collab" in path → CollabDiff
+       - "adm" in path → ADM
+    3. If nothing matches, returns "UNKNOWN".
+
+    Args:
+        path_str (str): File path as string.
+
+    Returns:
+        str: Canonical dataset name.
     """
     stem = Path(path_str).stem
     m = DATASET_REGEX.match(stem)
     if m:
-        return m.group(1)
-    parts = stem.split("_")
-    return parts[-1] if len(parts) >= 2 else "UNKNOWN"
+        return _normalize_tag(m.group(1))
 
+    # Fallback: infer from directory names
+    p = str(path_str).lower()
+    if "sid_dataset" in p or "/authentic/" in p or "/fully_synthetic/" in p:
+        return "SID"
+    if "collab" in p:
+        return "CollabDiff"
+    if "/adm/" in p:
+        return "ADM"
+    return "UNKNOWN"
 # ------------------ Dataset (on-the-fly resize) ------------------
 
 class RealFakeFolder(Dataset):
     """
-    Loads:
+    Dataset that loads images from:
       <root>/real/*.jpg|png|...
       <root>/fake/*.jpg|png|...
 
-    All resizing happens in memory via torchvision transforms.
+    The class:
+    - Recursively scans subfolders under real/ and fake/.
+    - Stores (path, label) tuples, where label=0 for real and 1 for fake.
+    - Applies a torchvision transform (resize, crop, normalization) on-the-fly.
+    - Additionally parses a dataset tag from the file path (ADM / CollabDiff / SID / UNKNOWN).
     """
+    # Accepted image extensions
     exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
     def __init__(self, root, transform=None):
+        """
+        Build the list of all images under <root>/real and <root>/fake.
+
+        Args:
+            root: Root directory that contains 'real/' and 'fake/' subfolders.
+            transform: Optional torchvision transform applied to each PIL image.
+        """
         self.items = []
         root = Path(root)
-        for name, y in [("real", 0), ("fake", 1)]:  # 0=real, 1=fake
+        for name, y in [("real", 0), ("fake", 1)]:  # 0 = real, 1 = fake
             d = root / name
             if not d.is_dir():
                 raise FileNotFoundError(f"Missing folder: {d}")
+            # rglob to also support nested folders if needed
             for p in sorted(d.rglob("*")):
                 if p.suffix.lower() in self.exts:
                     self.items.append((str(p), y))
@@ -167,10 +184,28 @@ class RealFakeFolder(Dataset):
             raise RuntimeError(f"No images found under {root}")
         self.transform = transform
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """
+        Return the total number of images (real + fake).
+
+        Returns:
+            int: Number of items in the dataset.
+        """
         return len(self.items)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
+        """
+        Load an image and return its transformed tensor, label, path, and dataset tag.        
+        Args:
+            idx: Index of the image to load.
+        
+        Returns:
+            tuple[torch.Tensor, int, str, str]:
+            x: Transformed image tensor [3, H, W].
+            y: Label (0=real, 1=fake).
+            path: Original image path as a string.
+            dataset_name: Dataset tag inferred from the path.
+        """
         path, y = self.items[idx]
         img = Image.open(path).convert("RGB")
         x = self.transform(img) if self.transform is not None else img
@@ -178,12 +213,23 @@ class RealFakeFolder(Dataset):
         return x, y, path, dataset_name
 
 
-def make_loader(data_root, batch_size=64, workers=4):
+def make_loader(data_root, batch_size: int=64, workers: int=4):
     """
-    On-the-fly preprocessing:
-      - Resize(224) bicubic (shorter side -> 224)
-      - CenterCrop(224)
-      - ToTensor + Normalize(ImageNet)
+    Create a DataLoader over RealFakeFolder with DINO-friendly preprocessing.
+
+    Preprocessing steps:
+      - Resize(IMG_SIZE) using bicubic interpolation (shorter side -> IMG_SIZE).
+      - CenterCrop(IMG_SIZE) to get a square.
+      - ToTensor() to convert to [0,1] floats.
+      - Normalize with ImageNet mean/std.
+
+    Args:
+        data_root (str | Path): Directory containing 'real/' and 'fake/'.
+        batch_size (int): Batch size for the DataLoader.
+        workers (int): Number of worker processes.
+
+    Returns:
+        tuple[DataLoader, RealFakeFolder]: The DataLoader and the underlying dataset.
     """
     tfm = T.Compose([
         T.Resize(IMG_SIZE, interpolation=T.InterpolationMode.BICUBIC),
@@ -193,24 +239,37 @@ def make_loader(data_root, batch_size=64, workers=4):
     ])
     ds = RealFakeFolder(data_root, transform=tfm)
     loader = DataLoader(
-        ds, batch_size=batch_size, shuffle=False,
-        num_workers=workers, pin_memory=True, drop_last=False
+        ds, 
+        batch_size=batch_size, 
+        shuffle=False,
+        num_workers=workers, 
+        pin_memory=True, 
+        drop_last=False
     )
     return loader, ds
 
 # ------------------ Model / Embeddings (timm only) ------------------
 
-def create_dinov2(model_name="dinov2-b14", device="cuda"):
+def create_backbone(model_name: str="dinov2-l14", device: str="cuda"):
     """
-    Create a timm DINOv2 model as a feature extractor.
-    num_classes=0 -> forward() returns features.
-    We pass img_size=224 so timm resizes/interpolates pos-embeds accordingly.
+    Create a timm ViT backbone (DINOv2 / DINOv3) as a feature extractor.
+
+    - Resolves short aliases (dinov2-b14, etc.) to full timm names.
+    - Uses num_classes=0 so forward() returns features instead of logits.
+    - Forces img_size=IMG_SIZE so positional embeddings match 224×224.
+
+    Args:
+        model_name (str): Alias or full timm model name.
+        device (str): Target device, usually "cuda" or "cpu".
+
+    Returns:
+        torch.nn.Module: A ViT backbone in eval mode on the specified device.
     """
     model_name = NAME_MAP.get(model_name, model_name)  # resolve alias
     model = timm.create_model(
         model_name,
         pretrained=True,
-        num_classes=0,    # features only
+        num_classes=0,    # features only (CLS embedding)
         img_size=IMG_SIZE # ensure 224 grid at creation
     )
     model.eval().to(device)
@@ -218,11 +277,25 @@ def create_dinov2(model_name="dinov2-b14", device="cuda"):
 
 
 @torch.no_grad()
-def embed_cls(model, x):
+def embed_cls(model, x: torch.Tensor) -> torch.Tensor:
     """
     Extract L2-normalized CLS embeddings (shape [B, D]) from a timm ViT.
+
+    Handles various timm output formats:
+    - Some models return a dict with keys like 'x_norm_clstoken', 'cls_token'.
+    - Others return a tensor [B, N, D] where N includes the CLS token at index 0.
+    - We always return a tensor [B, D], normalized along the last dimension.
+
+    Args:
+        model (torch.nn.Module): ViT backbone from timm (num_classes=0).
+        x (torch.Tensor): Input batch tensor [B, 3, H, W] already normalized.
+
+    Returns:
+        torch.Tensor: L2-normalized CLS embedding tensor [B, D].
     """
     feats = model.forward_features(x)
+
+    # timm models may return dictionaries or tensors depending on the backbone
     if isinstance(feats, dict):
         if "x_norm_clstoken" in feats:
             cls = feats["x_norm_clstoken"]
@@ -231,69 +304,133 @@ def embed_cls(model, x):
         elif "x_norm" in feats:
             cls = feats["x_norm"][:, 0]
         else:
+            # Fallback: take first tensor value and assume CLS at index 0 if 2D+
             first_tensor = next(v for v in feats.values() if torch.is_tensor(v))
             cls = first_tensor[:, 0] if first_tensor.dim() >= 2 else first_tensor
     else:
+        # Typical ViT output: [B, N, D] with CLS token at position 0
         cls = feats[:, 0]
+
+    # L2-normalize to make cosine distance well-defined and stable
     cls = F.normalize(cls, dim=-1)
     return cls
 
 # ------------------ Pixel-space perturbations ------------------
 
-def _mean_std(device, dtype):
+def _mean_std(device: str, dtype: torch.dtype):
+    """
+    Create broadcastable ImageNet mean/std tensors on the given device and dtype.
+
+    Args:
+        device (str): Target device (e.g., "cuda" or "cpu").
+        dtype (torch.dtype): Target data type (e.g., torch.float32).
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: (mean, std) each shaped [1, 3, 1, 1].
+    """
     mean = torch.tensor(IMAGENET_MEAN, device=device, dtype=dtype).view(1, 3, 1, 1)
     std  = torch.tensor(IMAGENET_STD,  device=device, dtype=dtype).view(1, 3, 1, 1)
     return mean, std
 
-def denorm(x_norm, mean, std):
-    """Inverse of Normalize: back to approx. pixel space [0..1]."""
+def denorm(x_norm: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    """
+    Invert torchvision.Normalize to get back to approx. pixel space [0..1].
+
+    Args:
+        x_norm (torch.Tensor): Normalized tensor [B, 3, H, W].
+        mean (torch.Tensor): Mean tensor [1, 3, 1, 1].
+        std (torch.Tensor): Std tensor [1, 3, 1, 1].
+
+    Returns:
+        torch.Tensor: Tensor in approximate [0,1] (pixel space).
+    """
     return x_norm * std + mean
 
-def renorm(x_pix, mean, std):
-    """Re-apply Normalize after pixel-space ops."""
+def renorm(x_pix: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    """
+    Apply torchvision.Normalize-like operation to a [0,1] pixel tensor.
+
+    Args:
+        x_pix (torch.Tensor): Tensor in [0,1] (pixel space) [B, 3, H, W].
+        mean (torch.Tensor): Mean tensor [1, 3, 1, 1].
+        std (torch.Tensor): Std tensor [1, 3, 1, 1].
+
+    Returns:
+        torch.Tensor: Normalized tensor suitable for the encoder [B, 3, H, W].
+    """
     return (x_pix - mean) / std
 
-def add_gaussian_noise_pixel(x_norm, sigma_pix, mean, std):
+def add_gaussian_noise_pixel(x_norm: torch.Tensor, sigma_pix: float, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
     """
     Add Gaussian noise in pixel space [0,1], then clip and re-normalize.
+
+    The noise is applied in pixel units, not in normalized space, to make
+    sigma interpretable as a change in the actual image intensities.
+
     Args:
-        x_norm: [B,3,H,W] normalized
-        sigma_pix: noise std in pixel units (e.g., 0.009)
+        x_norm (torch.Tensor): Normalized tensor [B, 3, H, W].
+        sigma_pix (float): Noise standard deviation in pixel units (e.g., 0.009).
+        mean (torch.Tensor): Mean tensor used to denormalize [1, 3, 1, 1].
+        std (torch.Tensor): Std tensor used to denormalize [1, 3, 1, 1].
+
+    Returns:
+        torch.Tensor: Perturbed, re-normalized tensor [B, 3, H, W].
     """
+    # Back to [0,1] pixel space
     x_pix = denorm(x_norm, mean, std)
+    # Add Gaussian noise
     noise = torch.randn_like(x_pix) * sigma_pix
     x_noisy = torch.clamp(x_pix + noise, 0.0, 1.0)
+    # Re-apply normalization for the encoder
     return renorm(x_noisy, mean, std)
 
 # ------------------ Pixel-space perturbations ------------------
 
-def gaussian_blur_pixel(x_norm: torch.Tensor, sigma_pix: float, mean, std, kernel_size: int | None = None):
+def gaussian_blur_pixel(x_norm: torch.Tensor, sigma_pix: float,  mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
     """
-    Fixed 3×3 Gaussian blur in pixel space [0,1], then re-normalize.
-    x_norm: [B,3,H,W] normalized (ImageNet)
-    sigma_pix: Gaussian std in pixels (default 0.55 matches paper).
+    Apply a fixed 3×3 Gaussian blur in pixel space [0,1], then re-normalize.
+
+    Blur is applied channel-wise using depthwise convolutions with a separable
+    1D Gaussian kernel (g_x and g_y). Padding is reflection-based to avoid
+    dark borders.
+
+    Args:
+        x_norm (torch.Tensor): Normalized tensor [B, 3, H, W] (ImageNet stats).
+        sigma_pix (float): Gaussian std in pixels. If <= 0, the input is returned.
+        mean (torch.Tensor): Mean tensor for de/normalization [1, 3, 1, 1].
+        std (torch.Tensor): Std tensor for de/normalization [1, 3, 1, 1].
+
+    Returns:
+        torch.Tensor: Blurred and re-normalized tensor with the same shape as x_norm.
     """
+
     if sigma_pix <= 0:
+        # No blur requested, return original tensor
         return x_norm
 
-    x_pix = denorm(x_norm, mean, std)              # -> [0,1]
+    # Convert to [0,1] pixel space
+    x_pix = denorm(x_norm, mean, std)
     B, C, H, W = x_pix.shape
     device, dtype = x_pix.device, x_pix.dtype
 
     # Fixed 3×3 separable kernel
     k = 3
     half = 1
-    t = torch.tensor([-1.0, 0.0, 1.0], device=device, dtype=dtype)  # length-3 axis
-    g1d = torch.exp(-0.5 * (t / max(sigma_pix, 1e-6))**2)
-    g1d = g1d / g1d.sum()  # normalize to sum=1
 
+    # 1D coordinate axis: [-1, 0, 1]
+    t = torch.tensor([-1.0, 0.0, 1.0], device=device, dtype=dtype)
+    # Gaussian over that axis
+    g1d = torch.exp(-0.5 * (t / max(sigma_pix, 1e-6))**2)
+    g1d = g1d / g1d.sum()  # normalize to sum = 1
+
+    # Construct depthwise 3×3 kernels for x and y directions
     g_x = g1d.view(1, 1, 1, k).repeat(C, 1, 1, 1)   # (C,1,1,3)
     g_y = g1d.view(1, 1, k, 1).repeat(C, 1, 1, 1)   # (C,1,3,1)
 
-    # reflect padding of 1 pixel
+    # Reflect padding of 1 pixel on all sides
     x_pad = F.pad(x_pix, (half, half, half, half), mode="reflect")
 
-    # depthwise conv: groups=C
+    # Depthwise convolution: blur horizontally then vertically
     out = F.conv2d(x_pad, g_x, groups=C)
     out = F.conv2d(out,   g_y, groups=C)
 
@@ -302,32 +439,65 @@ def gaussian_blur_pixel(x_norm: torch.Tensor, sigma_pix: float, mean, std, kerne
 
 # ------------------ Scoring & Metrics ------------------
 
-def cosine_distance(e0, e1):
-    """Cosine distance for L2-normalized embeddings (1 - cosine_sim)."""
+def cosine_distance(e0: torch.Tensor, e1: torch.Tensor) -> torch.Tensor:
+    """
+    Compute cosine distance for L2-normalized embeddings.
+
+    Because embeddings are normalized, this is equivalent to:
+        1 - cosine_similarity(e0, e1)
+
+    Args:
+        e0 (torch.Tensor): Embedding tensor [B, D].
+        e1 (torch.Tensor): Embedding tensor [B, D].
+
+    Returns:
+        torch.Tensor: Distance tensor [B], where larger means more different.
+    """
     return 1.0 - torch.sum(e0 * e1, dim=-1)
 
 @torch.no_grad()
-def score_loader(model, loader, sigma=0.009, n_noise=3, device="cuda"):
+def score_loader(model, loader: DataLoader, sigma: float = 0.009, n_noise: int = 3, device: str = "cuda"):
     """
-    Compute RIGID scores:
-      - e0 = CLS clean
-      - repeat n_noise: add Gaussian noise in [0,1], get e1, compute distance
-      - final score = mean distance over n_noise
+    Compute RIGID-style scores with Gaussian noise (Noise baseline).
+
+    For each batch:
+      - e0 = CLS embedding of the clean image.
+      - For n_noise times:
+          * Add Gaussian noise in pixel space.
+          * Re-normalize and re-embed → e1.
+          * Compute cosine distance d_i = 1 - cos(e0, e1).
+      - Final score = mean(d_i) over n_noise.
+
+    Args:
+        model (torch.nn.Module): ViT backbone (timm).
+        loader (DataLoader): DataLoader over RealFakeFolder.
+        sigma (float): Noise std in pixel units [0,1].
+        n_noise (int): Number of independent noise samples to average.
+        device (str): Device on which to run the model ("cuda" or "cpu").
+
     Returns:
-      scores [N], labels [N] (0=real,1=fake), paths [N], datasets [N]
+        tuple[torch.Tensor, torch.Tensor, list[str], list[str]]:
+            - scores: 1D tensor [N] of scores (higher = more unstable).
+            - labels: 1D tensor [N] (0 = real, 1 = fake).
+            - paths: List of file paths (str).
+            - datasets: List of dataset tags (str).
     """
     mean, std = _mean_std(device, torch.float32)
 
     all_scores, all_labels, all_paths, all_dsets = [], [], [], []
     for x, y, paths, dsets in loader:
         x = x.to(device, non_blocking=True)
+        # Embedding of the clean image
         e0 = embed_cls(model, x)
 
         dists = []
         for _ in range(n_noise):
+            # Perturb in pixel space and re-embed
             x_pert = add_gaussian_noise_pixel(x, sigma, mean, std)
             e1 = embed_cls(model, x_pert)
             dists.append(cosine_distance(e0, e1))
+
+        # Average distance across noise samples → robustness score
         d = torch.stack(dists, dim=0).mean(dim=0)  # [B]
 
         all_scores.append(d.cpu())
@@ -340,26 +510,56 @@ def score_loader(model, loader, sigma=0.009, n_noise=3, device="cuda"):
     return scores, labels, all_paths, all_dsets
 
 @torch.no_grad()
-def score_loader_blur(model, loader, sigma_blur=0.55, device="cuda"):
+def score_loader_blur(model, loader: DataLoader, sigma_blur: float = 0.55, device: str = "cuda"):
     """
-    Compute RIGID-style scores with *Gaussian blur* (single pass, fixed 3×3 kernel):
-      - e0 = CLS clean
-      - x_blur = gaussian_blur_pixel(x, sigma_blur) in [0,1], then re-normalize
-      - distance = 1 - cosine(e0, e_blur)
+    Compute RIGID-style scores using Gaussian blur + contrastive sharpening.
+
+    For each batch:
+      - Convert x_norm to x_pix in [0,1].
+      - Apply gaussian_blur_pixel to obtain x_blur.
+      - Build a "sharpened" version x_sharp_pix = clamp(2*x_pix - blurred_pix).
+      - Normalize both x_blur and x_sharp.
+      - Embed to e_blur and e_sharp.
+      - Score = cosine_distance(e_blur, e_sharp).
+
+    This is a contrastive blur setup: we compare a blurred and a sharpened
+    version to measure how sensitive the representation is to degradation.
+
+    Args:
+        model (torch.nn.Module): ViT backbone (timm).
+        loader (DataLoader): DataLoader over RealFakeFolder.
+        sigma_blur (float): Blur std in pixel units.
+        device (str): Device on which to run the model ("cuda" or "cpu").
+
     Returns:
-      scores [N], labels [N], paths [N], datasets [N]
+        tuple[torch.Tensor, torch.Tensor, list[str], list[str]]:
+            - scores: 1D tensor [N] of blur-based scores.
+            - labels: 1D tensor [N] (0 = real, 1 = fake).
+            - paths: List of file paths (str).
+            - datasets: List of dataset tags (str).
     """
     mean, std = _mean_std(device, torch.float32)
 
     all_scores, all_labels, all_paths, all_dsets = [], [], [], []
     for x, y, paths, dsets in loader:
         x = x.to(device, non_blocking=True)
-        e0 = embed_cls(model, x)
 
+        # Convert to [0,1] for blur/sharpen operations
+        x_pix = denorm(x, mean, std)
+        # Blurred version (already re-normalized internally)
         x_blur = gaussian_blur_pixel(x, sigma_blur, mean, std)
-        e1 = embed_cls(model, x_blur)
 
-        d = cosine_distance(e0, e1)  # [B]
+        # Contrastive "sharpened" version in pixel space:
+        # sharpen = clamp(2 * original - blurred, 0, 1)
+        x_sharp_pix = torch.clamp(2.0 * x_pix - denorm(x_blur, mean, std), 0.0, 1.0) # Contrastive blur formula
+        x_sharp = renorm(x_sharp_pix, mean, std)
+
+        # Encode blurred and sharpened images
+        e_blur  = embed_cls(model, x_blur)
+        e_sharp = embed_cls(model, x_sharp)
+
+        # Distance between blur and sharpen representations
+        d = cosine_distance(e_blur, e_sharp)
 
         all_scores.append(d.cpu())
         all_labels.append(y)
@@ -370,12 +570,35 @@ def score_loader_blur(model, loader, sigma_blur=0.55, device="cuda"):
     labels = torch.cat(all_labels)
     return scores, labels, all_paths, all_dsets
 
-def auroc(scores, labels):
-    """AUROC with sklearn (labels: 0=real, 1=fake; scores: higher=faker)."""
+def auroc(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    """
+    Compute AUROC with sklearn.
+
+    Args:
+        scores (torch.Tensor): 1D tensor [N] of anomaly scores (higher = more likely fake).
+        labels (torch.Tensor): 1D tensor [N] of binary labels (0 = real, 1 = fake).
+
+    Returns:
+        float: AUROC score.
+    """
     return float(roc_auc_score(labels.numpy(), scores.numpy()))
 
-def per_dataset_auroc(scores, labels, datasets):
-    """AUROC per dataset (requires both classes present)."""
+def per_dataset_auroc(scores: torch.Tensor, labels: torch.Tensor, datasets: list[str]) -> dict:
+    """
+    Compute AUROC per dataset, handling single-class edge cases.
+
+    If a dataset only contains a single class (all real or all fake),
+    AUROC is undefined; we return (NaN, n_samples) in that case.
+
+    Args:
+        scores (torch.Tensor): 1D tensor [N] of scores.
+        labels (torch.Tensor): 1D tensor [N] (0 or 1).
+        datasets (list[str]): List of dataset names, one per sample.
+
+    Returns:
+        dict[str, tuple[float, int]]:
+            Mapping from dataset name to (auroc, n_samples).
+    """
     idx_by_ds = defaultdict(list)
     for i, ds in enumerate(datasets):
         idx_by_ds[ds].append(i)
@@ -386,13 +609,29 @@ def per_dataset_auroc(scores, labels, datasets):
         y = labels[idxs]
         uniques = set(y.tolist())
         if len(uniques) < 2:
+            # Only one class present → AUROC not defined
             results[ds] = (float("nan"), len(idxs))
         else:
             results[ds] = (float(roc_auc_score(y.numpy(), s.numpy())), len(idxs))
     return results
 
-def threshold_at_fpr(real_scores, target_fpr=0.05):
-    """Choose threshold so that FPR ~= target_fpr on REAL scores."""
+def threshold_at_fpr(real_scores, target_fpr: float = 0.05) -> float:
+    """
+    Choose a threshold such that FPR ≈ target_fpr on REAL scores.
+
+    Implementation:
+      - Sort REAL scores ascending.
+      - Keep (1 - target_fpr) quantile as threshold.
+      - Under the assumption that fake scores are larger, this yields the
+        desired false positive rate for a rule "score >= thr means fake".
+
+    Args:
+        real_scores (torch.Tensor | list[float] | numpy.ndarray): Scores for real images.
+        target_fpr (float): Desired false positive rate (0..1).
+
+    Returns:
+        float: Threshold value on the score.
+    """
     real_scores = torch.as_tensor(real_scores)
     if real_scores.numel() == 0:
         return float("nan")
@@ -404,8 +643,29 @@ def threshold_at_fpr(real_scores, target_fpr=0.05):
 
 # ------------------ CSV Export Helpers ------------------
 
-def _save_csvs(results_dir: Path, paths, labels, scores, datasets, model_name_print, args, method_tag: str):
-    """Write per-image and summary CSVs for a given method_tag: 'noise' | 'blur' | 'minder'."""
+def _save_csvs(results_dir: Path, paths, labels: torch.Tensor, scores: torch.Tensor, datasets, model_name_print: str, args, method_tag: str) -> None:
+    """
+    Write per-image and summary CSVs for a given method.
+
+    This helper:
+      - Resolves output filenames based on method_tag ('noise'|'blur'|'minder').
+      - Writes per-image rows with columns: path, label, score, dataset.
+      - Computes global and per-dataset AUROC and writes a summary CSV.
+      - Uses pandas if available; falls back to Python's CSV module otherwise.
+
+    Args:
+        results_dir (Path): Root directory where CSVs will be written.
+        paths (list[str]): List of image paths.
+        labels (torch.Tensor): 1D tensor of labels (0 or 1).
+        scores (torch.Tensor): 1D tensor of scores.
+        datasets (list[str]): List of dataset tags.
+        model_name_print (str): Human-readable model name for logging/CSV.
+        args (argparse.Namespace): Parsed CLI arguments (store hyperparams in summary).
+        method_tag (str): One of 'noise', 'blur', or 'minder'.
+
+    Returns:
+        None
+    """
     if method_tag == "noise":
         out_scores = results_dir / "rigid_scores.csv"
         out_summary = results_dir / "rigid_summary.csv"
@@ -416,58 +676,61 @@ def _save_csvs(results_dir: Path, paths, labels, scores, datasets, model_name_pr
         out_scores = results_dir / "minder_scores.csv"
         out_summary = results_dir / "minder_summary.csv"
 
+    # Build per-image rows
     rows_scores = [{"path": p, "label": int(l), "score": float(s), "dataset": d}
                    for p, l, s, d in zip(paths, labels.tolist(), scores.tolist(), datasets)]
 
-    # Global AUROC + per-dataset
+    # Global AUROC
     roc_global = auroc(scores, labels)
     rows_summary = [{
         "dataset": "GLOBAL",
         "n": int(len(labels)),
         "auroc": float(roc_global),
-        "thr_at_fpr_0.05": "",
-        "fpr_on_cal_set":  "",
-        "tpr_on_cal_set":  "",
         "model": model_name_print,
         "sigma":      (float(args.sigma)      if method_tag in ("noise","minder") else ""),
         "sigma_blur": (float(args.sigma_blur) if method_tag in ("blur","minder")  else ""),
         "n_noise":    (int(args.n_noise)      if method_tag in ("noise","minder") else 1),
     }]
+
+    # Per-dataset AUROCs
     per_ds = per_dataset_auroc(scores, labels, datasets)
     for ds, (roc, n) in per_ds.items():
         rows_summary.append({
             "dataset": ds,
             "n": int(n),
             "auroc": (float(roc) if not (roc != roc) else ""),
-            "thr_at_fpr_0.05": "",
-            "fpr_on_cal_set":  "",
-            "tpr_on_cal_set":  "",
             "model": model_name_print,
             "sigma":      (float(args.sigma)      if method_tag in ("noise","minder") else ""),
             "sigma_blur": (float(args.sigma_blur) if method_tag in ("blur","minder")  else ""),
             "n_noise":    (int(args.n_noise)      if method_tag in ("noise","minder") else 1),
         })
 
-    try:
-        import pandas as pd
-        pd.DataFrame(rows_scores).to_csv(out_scores, index=False)
-        pd.DataFrame(rows_summary).to_csv(out_summary, index=False)
-    except Exception:
-        import csv
-        with open(out_scores, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["path","label","score","dataset"])
-            w.writeheader(); [w.writerow(r) for r in rows_scores]
-        with open(out_summary, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=[
-                "dataset","n","auroc","thr_at_fpr_0.05","fpr_on_cal_set","tpr_on_cal_set",
-                "model","sigma","sigma_blur","n_noise"
-            ])
-            w.writeheader(); [w.writerow(r) for r in rows_summary]
+    # Prefer pandas if available (nicer CSVs)
+    pd.DataFrame(rows_scores).to_csv(out_scores, index=False)
+    pd.DataFrame(rows_summary).to_csv(out_summary, index=False)
+
     print(f"[Saved] Per-image scores -> {out_scores}")
     print(f"[Saved] Summary AUROC    -> {out_summary}")
 
 def _load_scores_csv(path: Path):
-    import pandas as pd
+    """
+    Load a scores CSV and validate that the required columns are present.
+
+    Required columns:
+        - 'path'
+        - 'label'
+        - 'score'
+        - 'dataset'
+
+    Args:
+        path (Path): Path to the CSV file.
+
+    Returns:
+        pandas.DataFrame: DataFrame with the CSV contents.
+
+    Raises:
+        ValueError: If any required column is missing.
+    """
     df = pd.read_csv(path)
     for col in ("path","label","score","dataset"):
         if col not in df.columns:
@@ -476,60 +739,121 @@ def _load_scores_csv(path: Path):
 
 # ------------------ Main (CLI) ------------------
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments for the RIGID baseline script.
+
+    Returns:
+        argparse.Namespace: Parsed arguments.
+    """
     ap = argparse.ArgumentParser("RIGID baseline (timm, noise-only, per-dataset AUROC, CSV to results/)")
+    
+    # Data / model
     ap.add_argument("--data_root", default=None, type=str,
                     help="Folder with real/ and fake/ (required unless --minder_from_csv)")
-    ap.add_argument("--model", default="dinov2-l14", type=str,
-                    help="timm model or alias: dinov2-b14 | dinov2-l14 | dinov2-g14 | "
-                         "vit_base_patch14_dinov2.lvd142m, etc.")
+    ap.add_argument(
+        "--model",
+        default="dinov2-l14",
+        type=str,
+        help=(
+            "timm model or alias: "
+            "dinov2-s14|dinov2-l14|dinov2-g14, "
+            "dinov3-s16|dinov3-l16, "
+            "or any timm model name "
+            "(ex: vit_small_patch14_dinov2.lvd142m, vit_small_patch16_dinov3.lvd1689m)."
+        ),
+    )
+
+    # Loader hyperparameters
     ap.add_argument("--batch_size", default=64, type=int)
     ap.add_argument("--workers", default=4, type=int)
+
+    # Noise hyperparameters
     ap.add_argument("--sigma", default=0.009, type=float,
                     help="Gaussian noise std in pixel units [0,1] (try 0.008–0.010)")
     ap.add_argument("--n_noise", default=3, type=int,
                     help="How many noise samples to average")
+    
+    # Device
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", type=str)
+    
+    # Threshold calibration
     ap.add_argument("--calibrate_on_same_set", action="store_true",
                     help="Calibrate threshold@FPR=5% on the SAME REAL set (optimistic).")
+    
+    # Output directory
     ap.add_argument("--results_dir", default="results", type=str,
                     help="Directory to write CSV results (will be created if missing).")
+    
+    # Blur hyperparameters
     ap.add_argument("--sigma_blur", default=0.55, type=float,
                     help="Gaussian blur σ (fixed 3×3 kernel in pixel space; default 0.55).")    
+    
+    # Perturbation mode
     ap.add_argument("--perturb", default="both",
                     choices=["noise", "blur", "both", "minder"],
                     help="Perturbation to use: noise | blur | both (noise+blur [+minder]) | minder (max of noise/blur distances ≡ min of similarities))")
+    
+    # CSV-only MINDER mode
     ap.add_argument("--minder_from_csv", action="store_true",
                     help="Compute MINDER by merging existing rigid_scores.csv and blur_scores.csv (no recompute).")
     ap.add_argument("--rigid_csv", default="results/rigid_scores.csv", type=str)
     ap.add_argument("--blur_csv",  default="results/blur_scores.csv",  type=str)
     return ap.parse_args()
 
-def main():
+def main() -> None:
+    """
+    Entry point for the RIGID / Blur / MINDER evaluation script.
+
+    High-level flow:
+      - Parse CLI arguments.
+      - If --minder_from_csv:
+            * Load noise & blur CSVs.
+            * Merge on path, compute MINDER = min(noise, blur) per image.
+            * Compute AUROCs and export CSVs.
+        Else:
+            * Build DataLoader from data_root (real/fake).
+            * Create ViT backbone (DINOv2/v3).
+            * Depending on --perturb:
+                - 'noise': only RIGID (noise).
+                - 'blur' : only contrastive blur.
+                - 'minder': compute noise+blur then MINDER in-memory.
+                - 'both'  : export all three: noise, blur, minder.
+            * Optionally calibrate thr@FPR=5% on REAL scores.
+            * Write scores + summary CSVs under results_dir.
+
+    Returns:
+        None
+    """
     args = parse_args()
 
     # Prepare results directory
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # MINDER from existing CSVs
+    # ------------------- MINDER-from-CSV mode -------------------
     if args.minder_from_csv:
+        # Load RIGID (noise) and Blur scores
         rigid_df = _load_scores_csv(Path(args.rigid_csv)).rename(columns={"score":"score_noise"})
         blur_df  = _load_scores_csv(Path(args.blur_csv)).rename(columns={"score":"score_blur"})
-        # Merge on 'path' (intersection)
+        # Merge on 'path' to keep only common images
         df = rigid_df.merge(blur_df[["path","score_blur"]], on="path", how="inner")
         if df.empty:
             raise SystemExit("[Error] Merge produced 0 rows. Check that both CSVs refer to the same images/paths.")
+        
         # Build tensors for metrics/save helper
         paths    = df["path"].tolist()
         datasets = df["dataset"].tolist()   # dataset label from rigid_df
         labels   = torch.tensor(df["label"].values, dtype=torch.long)
         scores_n = torch.tensor(df["score_noise"].values, dtype=torch.float32)
         scores_b = torch.tensor(df["score_blur"].values,  dtype=torch.float32)
-        scores   = torch.minimum(scores_n, scores_b)  # MINDER
+
+        # MINDER score = min(noise_score, blur_score)
+        scores   = torch.minimum(scores_n, scores_b)
 
         model_name_print = "from-csv"
 
+        # Print metrics
         roc_global = auroc(scores, labels)
         print(f"[RIGID] Global AUROC (MINDER-from-CSV) = {roc_global:.4f}")
         per_ds = per_dataset_auroc(scores, labels, datasets)
@@ -538,45 +862,53 @@ def main():
             roc_str = f"{roc:.4f}" if not (roc != roc) else "NaN"
             print(f"  - {ds:<16} AUROC = {roc_str}  |  n = {n}")
 
+        # Save MINDER CSVs
         _save_csvs(results_dir, paths, labels, scores, datasets,
                 model_name_print, args, method_tag="minder")
         return
 
-    # ---- Normal path requires data_root ----
+    # ------------------- Normal evaluation path -------------------
+
+    # data_root is mandatory here
     if not args.data_root:
         raise SystemExit("Error: --data_root is required unless --minder_from_csv is set.")
 
     # Data (on-the-fly resize/crop -> 224)
     loader, _ = make_loader(args.data_root, batch_size=args.batch_size, workers=args.workers)
 
-    # Model (timm)
-    model = create_dinov2(args.model, device=args.device)
+    # Model (timm backbone)
+    model = create_backbone(args.model, device=args.device)
     model_name_print = NAME_MAP.get(args.model, args.model)
     print(f"[Info] Using timm model: {model_name_print} | Device: {args.device}")
 
-        # Score all images according to --perturb
+    # Score all images according to --perturb
     method = args.perturb
     if method == "noise":
+        # Noise-only RIGID
         scores, labels, paths, datasets = score_loader(
             model, loader, sigma=args.sigma, n_noise=args.n_noise, device=args.device
         )
         method_print = f"RIGID/Noise (sigma={args.sigma}, n_noise={args.n_noise})"
 
     elif method == "blur":
+        # Contrastive blur-only
         scores, labels, paths, datasets = score_loader_blur(
             model, loader, sigma_blur=args.sigma_blur, device=args.device
         )
         method_print = f"Blur (sigma_blur={args.sigma_blur})"
 
     elif method == "minder":
-        # Compute noise and blur scores (same alignment/order)
+        # Compute noise and blur scores (same alignment/order) then combine
+
+        # Noise scores
         scores_n, labels, paths, datasets = score_loader(
             model, loader, sigma=args.sigma, n_noise=args.n_noise, device=args.device
         )
+        # Blur scores
         scores_b, _, _, _ = score_loader_blur(
             model, loader, sigma_blur=args.sigma_blur, device=args.device
         )
-        # MINDER = per-image max(distance) ≡ min(similarity)
+        # MINDER = per-image min(distance) = max(similarity degradation)
         scores = torch.minimum(scores_n, scores_b)
 
         method_print = f"MINDER (max(noise,blur) distances; sigma={args.sigma}, n_noise={args.n_noise}, sigma_blur={args.sigma_blur})"
@@ -590,7 +922,7 @@ def main():
             roc_str = f"{roc:.4f}" if not (roc != roc) else "NaN"
             print(f"  - {ds:<16} AUROC = {roc_str}  |  n = {n}")
 
-        # threshold on same set 
+        # Optional threshold on same set (REAL scores only) 
         if args.calibrate_on_same_set:
             thr = threshold_at_fpr(scores[labels == 0], target_fpr=0.05)
             y_pred = (scores >= thr).int()
@@ -598,14 +930,14 @@ def main():
             tpr = ((y_pred[labels == 1] == 1).float().mean().item()) if (labels == 1).any() else float("nan")
             print(f"[RIGID/MINDER] thr@FPR=5% = {thr:.6f} | FPR={fpr:.3f} | TPR={tpr:.3f}")
 
-        # Save MINDER CSVs
+        # Save MINDER CSVs and stop
         _save_csvs(
             results_dir, paths, labels, scores, datasets,
             model_name_print, args, method_tag="minder"
         )
         return  # done
 
-    else:  # both
+    else:  # method == "both"
         # Run noise
         scores_n, labels, paths, datasets = score_loader(
             model, loader, sigma=args.sigma, n_noise=args.n_noise, device=args.device
@@ -615,8 +947,7 @@ def main():
             model, loader, sigma_blur=args.sigma_blur, device=args.device
         )
 
-        # Export both below; printing summaries separately
-        # First: NOISE
+        # First: NOISE summaries + CSVs
         roc_global = auroc(scores_n, labels)
         print(f"[RIGID] Global AUROC (NOISE) = {roc_global:.4f}")
         per_ds = per_dataset_auroc(scores_n, labels, datasets)
@@ -629,7 +960,7 @@ def main():
             model_name_print, args, method_tag="noise"
         )
 
-        # Then: BLUR
+        # Then: BLUR summaries + CSVs
         roc_global = auroc(scores_b, labels)
         print(f"[RIGID] Global AUROC (BLUR)  = {roc_global:.4f}")
         per_ds = per_dataset_auroc(scores_b, labels, datasets)
@@ -642,7 +973,7 @@ def main():
             model_name_print, args, method_tag="blur"
         )
 
-        # Finally: MINDER = min(noise, blur)
+        # Finally: MINDER = min(noise, blur) summaries + CSVs
         scores_m = torch.minimum(scores_n, scores_b)
         roc_global = auroc(scores_m, labels)
         print(f"[RIGID] Global AUROC (MINDER) = {roc_global:.4f}")
@@ -676,7 +1007,7 @@ def main():
         tpr = ((y_pred[labels == 1] == 1).float().mean().item()) if (labels == 1).any() else float("nan")
         print(f"[RIGID] thr@FPR=5% = {thr:.6f} | FPR={fpr:.3f} | TPR={tpr:.3f}")
 
-    # Save CSVs
+    # Save CSVs for noise/blur
     method_tag = "noise" if method == "noise" else "blur"
     _save_csvs(
         results_dir, paths, labels, scores, datasets,

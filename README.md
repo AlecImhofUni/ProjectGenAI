@@ -163,7 +163,7 @@ Run
   --device cuda
 ```
 
-TThis will:
+This will:
 - drop any sample whose dataset tag is not in {ADM, CollabDiff},
 - compute **Noise, Contrastive Blur, and MINDER = min(Noise, Blur)** scores
 - print global and per-dataset for Noise, Blur, MINDER

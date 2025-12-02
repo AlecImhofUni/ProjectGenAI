@@ -42,7 +42,7 @@ Run
 ```
 By default:
 - model: `dinov2-l14`
-- perturbation: `--perturb both` (Noise + Blur + MINDER)
+- perturbation: `--perturb both` (Noise + Contrastive Blur + MINDER)
 - results are saved under `./results/`
 
 Find all available CLI arguments in `available_cli_arguments.md`
@@ -78,7 +78,7 @@ Run
 ```
 
 This will:
-- run **contrastive blur** only
+- run **Contrastive Blur** only
 - print global and per-dataset AUROC
 - write:
     - `results/blur_scores.csv`
@@ -98,14 +98,14 @@ Run
 ```
 
 This will:
-- compute **Noise, Blur, and MINDER = min(Noise, Blur)** scores
+- compute **Noise, Contrastive Blur, and MINDER = min(Noise, Blur)** scores
 - print global and per-dataset for Noise, Blur, MINDER
 - save:
     - `results/rigid_scores.csv` / `results/rigid_summary.csv`
     - `results/blur_scores.csv` / `results/blur_summary.csv`
     - `results/minder_scores.csv` / `minder_summary.csv`
 
-### MINDER only (compute Noise + Blur in memory)
+### MINDER only (compute Noise + Contrastive Blur in memory)
 Run 
 ```bash
     python training_free_detect.py \
@@ -142,5 +142,32 @@ In this mode:
     - prints AUROCs
     - saves `results/minder_scores.csv` and `results/minder_summary.csv`
 
+### Restricting to specific datasets (e.g. exclude SID)
+All modes support an optional --datasets argument to restrict which datasets are included
+in the evaluation. Dataset tags are inferred from filenames/paths and normalized to:
+- ADM
+- CollabDiff
+- SID
+- UNKNOWN
+Example: run Noise + Contrastive Blur + MINDER on **ADM + CollabDiff only**
 
+Run 
+```bash
+    python training_free_detect.py \
+  --data_root /path/to/pairs_1000_eval \
+  --perturb both \
+  --sigma 0.009 \
+  --n_noise 3 \
+  --sigma_blur 0.55 \
+  --datasets ADM CollabDiff \
+  --device cuda
+```
 
+TThis will:
+- drop any sample whose dataset tag is not in {ADM, CollabDiff},
+- compute **Noise, Contrastive Blur, and MINDER = min(Noise, Blur)** scores
+- print global and per-dataset for Noise, Blur, MINDER
+- save:
+    - `results/rigid_scores.csv` / `results/rigid_summary.csv`
+    - `results/blur_scores.csv` / `results/blur_summary.csv`
+    - `results/minder_scores.csv` / `minder_summary.csv`

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Training-free detection of AI-generated images with VFMs (DINOv2) — RIGID (Noise), Blur, and MINDER.
+Training-free detection of AI-generated images with VFMs (DINOv2) — RIGID (Noise), Contrastive Blur, and MINDER.
 Computes global and per-dataset AUROC; writes per-image and summary CSVs to a dedicated 'results/' dir.
 
 What this script does
@@ -9,9 +9,11 @@ What this script does
 - Reads images from data_root/{real,fake} and resizes on-the-fly to 224×224 (Resize -> CenterCrop); no disk recompression.
 - Applies **pixel-space perturbations** on [0,1] images, then re-normalizes for the encoder:
     • **Noise (RIGID)**: add Gaussian noise σ ∈ [0,1] (repeat n_noise, average distance).
-    • **Blur**: Gaussian blur with σ_blur in **pixels** (deterministic, 1 pass).
-    • **MINDER**: per-image min between Noise and Blur scores (either computed in-memory or from CSVs).
-- Scores each image by **cosine distance**: 1 − cos(embedding_clean, embedding_perturbed).
+    • **Contrastive Blur**: compare a **blurred** version and a **sharpened** version of the image
+      (Gaussian blur with σ_blur in pixels, then contrastive sharpening: x_sharp = clamp(2·x - x_blur)).
+    • **MINDER**: per-image **min** between Noise and Contrastive Blur scores
+      (either computed in-memory or from CSVs).
+- Scores each image by **cosine distance**: 1 − cos(embedding_clean, embedding_perturbed) (or between blur vs sharp).
   Higher score ⇒ more sensitive ⇒ more likely **fake**.
 - Reports **GLOBAL** AUROC and **per-dataset** AUROC (dataset parsed from filename or CSV tag).
 - Exports per-image CSVs (path, label, score, dataset) and summary CSVs (GLOBAL + per-dataset AUROC).
@@ -28,16 +30,16 @@ Outputs (CSV)
   results/
     rigid_scores.csv    | per-image (Noise) : path,label,score,dataset
     rigid_summary.csv   | GLOBAL + per-dataset AUROC (+ hyperparams)
-    blur_scores.csv     | per-image (Blur)
-    blur_summary.csv    | summary (Blur)
-    minder_scores.csv   | per-image (MINDER = max of Noise/Blur distances ≡ min of similarities)
+    blur_scores.csv     | per-image (Contrastive Blur)
+    blur_summary.csv    | summary (Contrastive Blur)
+    minder_scores.csv   | per-image (MINDER = min(Noise, Blur) distance)
     minder_summary.csv  | summary (MINDER)
 
 Key CLI flags
 -------------
   --perturb {noise,blur,both,minder}
       noise  : compute Noise only
-      blur   : compute Blur only
+      blur   : compute Contrastive Blur only
       both   : compute Noise, then Blur, then MINDER in the same run
       minder : compute Noise+Blur in-memory and export MINDER only
   --sigma <float>         Gaussian **noise** std in pixel units [0,1]  (e.g., 0.009)
@@ -98,10 +100,10 @@ def _normalize_tag(tag: str) -> str:
     Normalize raw dataset tag strings to a canonical set.
 
     Args:
-        tag (int): Raw dataset tag string.
+        tag (str): Raw dataset tag string.
 
     Returns:
-        str: Original tag otherwise.
+        str: Canonical tag ("ADM", "CollabDiff", "SID", or original tag).
     """
     t = tag.strip()
     if t.upper() in {"ADM"}:
@@ -456,7 +458,7 @@ def cosine_distance(e0: torch.Tensor, e1: torch.Tensor) -> torch.Tensor:
     return 1.0 - torch.sum(e0 * e1, dim=-1)
 
 @torch.no_grad()
-def score_loader(model, loader: DataLoader, sigma: float = 0.009, n_noise: int = 3, device: str = "cuda"):
+def score_loader(model, loader: DataLoader, sigma: float = 0.009, n_noise: int = 3, device: str = "cuda", allowed_datasets=None):
     """
     Compute RIGID-style scores with Gaussian noise (Noise baseline).
 
@@ -474,6 +476,7 @@ def score_loader(model, loader: DataLoader, sigma: float = 0.009, n_noise: int =
         sigma (float): Noise std in pixel units [0,1].
         n_noise (int): Number of independent noise samples to average.
         device (str): Device on which to run the model ("cuda" or "cpu").
+        allowed_datasets (set[str] | None): If provided, only keep samples from these datasets.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor, list[str], list[str]]:
@@ -483,9 +486,24 @@ def score_loader(model, loader: DataLoader, sigma: float = 0.009, n_noise: int =
             - datasets: List of dataset tags (str).
     """
     mean, std = _mean_std(device, torch.float32)
+    allowed_set = None
+    if allowed_datasets:
+        # case-insensitive match
+        allowed_set = {ds.lower() for ds in allowed_datasets}
 
     all_scores, all_labels, all_paths, all_dsets = [], [], [], []
     for x, y, paths, dsets in loader:
+        # Filter batch by dataset if needed
+        if allowed_set is not None:
+            mask = [ds.lower() in allowed_set for ds in dsets]
+            if not any(mask):
+                continue
+            idx = [i for i, keep in enumerate(mask) if keep]
+            x = x[idx]
+            y = y[idx]
+            paths = [paths[i] for i in idx]
+            dsets = [dsets[i] for i in idx]
+
         x = x.to(device, non_blocking=True)
         # Embedding of the clean image
         e0 = embed_cls(model, x)
@@ -505,31 +523,42 @@ def score_loader(model, loader: DataLoader, sigma: float = 0.009, n_noise: int =
         all_paths.extend(paths)
         all_dsets.extend(dsets)
 
+    if not all_scores:
+        raise RuntimeError(
+            "No samples left after applying dataset filter "
+            f"(allowed={allowed_datasets})."
+        )
+
     scores = torch.cat(all_scores)
     labels = torch.cat(all_labels)
     return scores, labels, all_paths, all_dsets
 
 @torch.no_grad()
-def score_loader_blur(model, loader: DataLoader, sigma_blur: float = 0.55, device: str = "cuda"):
+def score_loader_blur(model, loader: DataLoader, sigma_blur: float = 0.55, device: str = "cuda", allowed_datasets=None):
     """
-    Compute RIGID-style scores using Gaussian blur + contrastive sharpening.
+    Compute contrastive blur scores using Gaussian blur + contrastive sharpening.
 
     For each batch:
-      - Convert x_norm to x_pix in [0,1].
-      - Apply gaussian_blur_pixel to obtain x_blur.
-      - Build a "sharpened" version x_sharp_pix = clamp(2*x_pix - blurred_pix).
-      - Normalize both x_blur and x_sharp.
+      - Start from normalized images x_norm.
+      - Convert to pixel space x_pix in [0,1].
+      - Apply gaussian_blur_pixel(x_norm, sigma_blur, ...) to get a **blurred** normalized tensor x_blur.
+      - Convert x_blur back to pixels: x_blur_pix = denorm(x_blur, mean, std).
+      - Build a "sharpened" version in pixel space:
+            x_sharp_pix = clamp(2 * x_pix - x_blur_pix, 0, 1)
+        (this increases local contrast relative to the blurred version).
+      - Normalize x_sharp_pix to get x_sharp (x is already normalized).
       - Embed to e_blur and e_sharp.
       - Score = cosine_distance(e_blur, e_sharp).
 
-    This is a contrastive blur setup: we compare a blurred and a sharpened
-    version to measure how sensitive the representation is to degradation.
+    This is a **contrastive blur** setup: we directly compare a blurred and a sharpened
+    version of the image to measure how sensitive the representation is to degradations.
 
     Args:
         model (torch.nn.Module): ViT backbone (timm).
         loader (DataLoader): DataLoader over RealFakeFolder.
         sigma_blur (float): Blur std in pixel units.
         device (str): Device on which to run the model ("cuda" or "cpu").
+        allowed_datasets (set[str] | None): If provided, only keep samples from these datasets.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor, list[str], list[str]]:
@@ -539,32 +568,47 @@ def score_loader_blur(model, loader: DataLoader, sigma_blur: float = 0.55, devic
             - datasets: List of dataset tags (str).
     """
     mean, std = _mean_std(device, torch.float32)
+    allowed_set = None
+    if allowed_datasets:
+        allowed_set = {ds.lower() for ds in allowed_datasets}
 
     all_scores, all_labels, all_paths, all_dsets = [], [], [], []
     for x, y, paths, dsets in loader:
+        # Filter batch by dataset if needed
+        if allowed_set is not None:
+            mask = [ds.lower() in allowed_set for ds in dsets]
+            if not any(mask):
+                continue
+            idx = [i for i, keep in enumerate(mask) if keep]
+            x = x[idx]
+            y = y[idx]
+            paths = [paths[i] for i in idx]
+            dsets = [dsets[i] for i in idx]
+
         x = x.to(device, non_blocking=True)
 
         # Convert to [0,1] for blur/sharpen operations
         x_pix = denorm(x, mean, std)
-        # Blurred version (already re-normalized internally)
         x_blur = gaussian_blur_pixel(x, sigma_blur, mean, std)
 
-        # Contrastive "sharpened" version in pixel space:
-        # sharpen = clamp(2 * original - blurred, 0, 1)
-        x_sharp_pix = torch.clamp(2.0 * x_pix - denorm(x_blur, mean, std), 0.0, 1.0) # Contrastive blur formula
+        x_sharp_pix = torch.clamp(2.0 * x_pix - denorm(x_blur, mean, std), 0.0, 1.0)
         x_sharp = renorm(x_sharp_pix, mean, std)
 
-        # Encode blurred and sharpened images
         e_blur  = embed_cls(model, x_blur)
         e_sharp = embed_cls(model, x_sharp)
 
-        # Distance between blur and sharpen representations
         d = cosine_distance(e_blur, e_sharp)
 
         all_scores.append(d.cpu())
         all_labels.append(y)
         all_paths.extend(paths)
         all_dsets.extend(dsets)
+
+    if not all_scores:
+        raise RuntimeError(
+            "No samples left after applying dataset filter "
+            f"(allowed={allowed_datasets})."
+        )
 
     scores = torch.cat(all_scores)
     labels = torch.cat(all_labels)
@@ -651,7 +695,7 @@ def _save_csvs(results_dir: Path, paths, labels: torch.Tensor, scores: torch.Ten
       - Resolves output filenames based on method_tag ('noise'|'blur'|'minder').
       - Writes per-image rows with columns: path, label, score, dataset.
       - Computes global and per-dataset AUROC and writes a summary CSV.
-      - Uses pandas if available; falls back to Python's CSV module otherwise.
+      - Uses pandas to write per-image and summary CSVs.
 
     Args:
         results_dir (Path): Root directory where CSVs will be written.
@@ -746,31 +790,30 @@ def parse_args() -> argparse.Namespace:
     Returns:
         argparse.Namespace: Parsed arguments.
     """
-    ap = argparse.ArgumentParser("RIGID baseline (timm, noise-only, per-dataset AUROC, CSV to results/)")
-    
+    ap = argparse.ArgumentParser("RIGID baseline (timm, noise + contrastive blur + MINDER, per-dataset AUROC, CSV to results/)")
+
     # Data / model
     ap.add_argument("--data_root", default=None, type=str,
                     help="Folder with real/ and fake/ (required unless --minder_from_csv)")
-    ap.add_argument(
-        "--model",
-        default="dinov2-l14",
-        type=str,
-        help=(
-            "timm model or alias: "
-            "dinov2-s14|dinov2-l14|dinov2-g14, "
-            "dinov3-s16|dinov3-l16, "
-            "or any timm model name "
-            "(ex: vit_small_patch14_dinov2.lvd142m, vit_small_patch16_dinov3.lvd1689m)."
-        ),
-    )
+    ap.add_argument("--model", default="dinov2-l14",
+                type=str,
+                help=(
+                    "timm model or alias: "
+                    "dinov2-s14|dinov2-l14|dinov2-g14, "
+                    "dinov3-s16|dinov3-l16, "
+                    "or any timm model name "
+                    "(ex: vit_small_patch14_dinov2.lvd142m, vit_small_patch16_dinov3.lvd1689m)."
+                ),)
 
     # Loader hyperparameters
     ap.add_argument("--batch_size", default=64, type=int)
     ap.add_argument("--workers", default=4, type=int)
 
     # Noise hyperparameters
-    ap.add_argument("--sigma", default=0.009, type=float,
-                    help="Gaussian noise std in pixel units [0,1] (try 0.008–0.010)")
+    ap.add_argument("--sigma", default=0.009, 
+                    type=float,
+                    help="Gaussian noise std in pixel units [0,1] (try 0.008–0.010)"
+                    )
     ap.add_argument("--n_noise", default=3, type=int,
                     help="How many noise samples to average")
     
@@ -791,14 +834,31 @@ def parse_args() -> argparse.Namespace:
     
     # Perturbation mode
     ap.add_argument("--perturb", default="both",
-                    choices=["noise", "blur", "both", "minder"],
-                    help="Perturbation to use: noise | blur | both (noise+blur [+minder]) | minder (max of noise/blur distances ≡ min of similarities))")
+                choices=["noise", "blur", "both", "minder"],
+                help=(
+                    "Perturbation to use: "
+                    "noise | blur | both (noise + contrastive blur + minder) | "
+                    "minder (MINDER = min(noise, blur) distances)."
+                ))
     
     # CSV-only MINDER mode
     ap.add_argument("--minder_from_csv", action="store_true",
                     help="Compute MINDER by merging existing rigid_scores.csv and blur_scores.csv (no recompute).")
     ap.add_argument("--rigid_csv", default="results/rigid_scores.csv", type=str)
     ap.add_argument("--blur_csv",  default="results/blur_scores.csv",  type=str)
+
+    # Dataset selection (optional)
+    ap.add_argument(
+        "--datasets",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional list of dataset tags to include, e.g.: "
+            "--datasets ADM CollabDiff. "
+            "Tags are matched after normalization (ADM, CollabDiff, SID, UNKNOWN)."
+        ),
+    )
+
     return ap.parse_args()
 
 def main() -> None:
@@ -833,14 +893,20 @@ def main() -> None:
 
     # ------------------- MINDER-from-CSV mode -------------------
     if args.minder_from_csv:
-        # Load RIGID (noise) and Blur scores
-        rigid_df = _load_scores_csv(Path(args.rigid_csv)).rename(columns={"score":"score_noise"})
-        blur_df  = _load_scores_csv(Path(args.blur_csv)).rename(columns={"score":"score_blur"})
+        # Load RIGID (noise) and Contrastive Blur scores
+        rigid_df = _load_scores_csv(Path(args.rigid_csv)).rename(columns={"score": "score_noise"})
+        blur_df  = _load_scores_csv(Path(args.blur_csv)).rename(columns={"score": "score_blur"})
+
         # Merge on 'path' to keep only common images
-        df = rigid_df.merge(blur_df[["path","score_blur"]], on="path", how="inner")
+        df = rigid_df.merge(blur_df[["path", "score_blur"]], on="path", how="inner")
+        if args.datasets:
+            df = df[df["dataset"].isin(args.datasets)]
         if df.empty:
-            raise SystemExit("[Error] Merge produced 0 rows. Check that both CSVs refer to the same images/paths.")
-        
+            raise SystemExit(
+                "[Error] Merge produced 0 rows after merge/dataset filter. "
+                f"Check --rigid_csv, --blur_csv and --datasets={args.datasets}."
+            )
+
         # Build tensors for metrics/save helper
         paths    = df["path"].tolist()
         datasets = df["dataset"].tolist()   # dataset label from rigid_df
@@ -848,23 +914,23 @@ def main() -> None:
         scores_n = torch.tensor(df["score_noise"].values, dtype=torch.float32)
         scores_b = torch.tensor(df["score_blur"].values,  dtype=torch.float32)
 
-        # MINDER score = min(noise_score, blur_score)
+        # MINDER score = min(noise_score, blur_score) in distance space
         scores   = torch.minimum(scores_n, scores_b)
 
         model_name_print = "from-csv"
 
         # Print metrics
         roc_global = auroc(scores, labels)
-        print(f"[RIGID] Global AUROC (MINDER-from-CSV) = {roc_global:.4f}")
+        print(f"[MINDER/CSV] Global AUROC = {roc_global:.4f}")
         per_ds = per_dataset_auroc(scores, labels, datasets)
-        print("[RIGID] Per-dataset AUROC (MINDER-from-CSV):")
+        print("[MINDER/CSV] Per-dataset AUROC:")
         for ds, (roc, n) in per_ds.items():
             roc_str = f"{roc:.4f}" if not (roc != roc) else "NaN"
             print(f"  - {ds:<16} AUROC = {roc_str}  |  n = {n}")
 
         # Save MINDER CSVs
         _save_csvs(results_dir, paths, labels, scores, datasets,
-                model_name_print, args, method_tag="minder")
+                   model_name_print, args, method_tag="minder")
         return
 
     # ------------------- Normal evaluation path -------------------
@@ -886,14 +952,14 @@ def main() -> None:
     if method == "noise":
         # Noise-only RIGID
         scores, labels, paths, datasets = score_loader(
-            model, loader, sigma=args.sigma, n_noise=args.n_noise, device=args.device
+            model, loader, sigma=args.sigma, n_noise=args.n_noise, device=args.device, allowed_datasets=args.datasets
         )
         method_print = f"RIGID/Noise (sigma={args.sigma}, n_noise={args.n_noise})"
 
     elif method == "blur":
         # Contrastive blur-only
         scores, labels, paths, datasets = score_loader_blur(
-            model, loader, sigma_blur=args.sigma_blur, device=args.device
+            model, loader, sigma_blur=args.sigma_blur, device=args.device, allowed_datasets=args.datasets
         )
         method_print = f"Blur (sigma_blur={args.sigma_blur})"
 
@@ -902,16 +968,19 @@ def main() -> None:
 
         # Noise scores
         scores_n, labels, paths, datasets = score_loader(
-            model, loader, sigma=args.sigma, n_noise=args.n_noise, device=args.device
+            model, loader, sigma=args.sigma, n_noise=args.n_noise, device=args.device, allowed_datasets=args.datasets
         )
         # Blur scores
         scores_b, _, _, _ = score_loader_blur(
-            model, loader, sigma_blur=args.sigma_blur, device=args.device
+            model, loader, sigma_blur=args.sigma_blur, device=args.device, allowed_datasets=args.datasets
         )
         # MINDER = per-image min(distance) = max(similarity degradation)
         scores = torch.minimum(scores_n, scores_b)
 
-        method_print = f"MINDER (max(noise,blur) distances; sigma={args.sigma}, n_noise={args.n_noise}, sigma_blur={args.sigma_blur})"
+        method_print = (
+            f"MINDER (min(noise, blur) distances; "
+            f"sigma={args.sigma}, n_noise={args.n_noise}, sigma_blur={args.sigma_blur})"
+        )
 
         # Print metrics (global + per-dataset)
         roc_global = auroc(scores, labels)
@@ -940,11 +1009,11 @@ def main() -> None:
     else:  # method == "both"
         # Run noise
         scores_n, labels, paths, datasets = score_loader(
-            model, loader, sigma=args.sigma, n_noise=args.n_noise, device=args.device
+            model, loader, sigma=args.sigma, n_noise=args.n_noise, device=args.device, allowed_datasets=args.datasets
         )
         # Run blur (re-use labels/paths/datasets from above)
         scores_b, _, _, _ = score_loader_blur(
-            model, loader, sigma_blur=args.sigma_blur, device=args.device
+            model, loader, sigma_blur=args.sigma_blur, device=args.device, allowed_datasets=args.datasets
         )
 
         # First: NOISE summaries + CSVs

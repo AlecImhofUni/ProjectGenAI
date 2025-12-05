@@ -1,0 +1,4 @@
+dataset,n,auroc,model,sigma,sigma_blur,n_noise
+GLOBAL,2000,0.773902,vit_large_patch14_dinov2.lvd142m,0.009,,3
+ADM,1000,0.9012439999999999,vit_large_patch14_dinov2.lvd142m,0.009,,3
+CollabDiff,1000,0.711468,vit_large_patch14_dinov2.lvd142m,0.009,,3

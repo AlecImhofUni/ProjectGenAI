@@ -1,5 +1,5 @@
 dataset,n,auroc,model,sigma,sigma_blur,n_noise
-GLOBAL,4000,0.57253,vit_large_patch16_dinov3.lvd1689m,0.009,0.55,3
-ADM,1000,0.825024,vit_large_patch16_dinov3.lvd1689m,0.009,0.55,3
-CollabDiff,1000,0.7906520000000001,vit_large_patch16_dinov3.lvd1689m,0.009,0.55,3
-SID,2000,0.343463,vit_large_patch16_dinov3.lvd1689m,0.009,0.55,3
+GLOBAL,4000,0.717826625,vit_large_patch16_dinov3.lvd1689m,0.008,0.85,3
+ADM,1000,0.88576,vit_large_patch16_dinov3.lvd1689m,0.008,0.85,3
+CollabDiff,1000,0.7097800000000001,vit_large_patch16_dinov3.lvd1689m,0.008,0.85,3
+SID,2000,0.62766,vit_large_patch16_dinov3.lvd1689m,0.008,0.85,3

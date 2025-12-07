@@ -56,6 +56,21 @@ These parameters are used when:
 - `--perturb minder`
 - or `--minder_from_csv` combined with a noise CSV.
 
+### Noise scoring mode
+
+- `--score_mode_noise <str>` (default: `cls`, choices: `cls`, `topk_patches`)  
+  How to compute **noise-based** anomaly scores:
+
+  - `cls`  
+    Use the cosine distance on **CLS embeddings** (original RIGID).
+
+  - `topk_patches`  
+    Compute patch-wise distances and take the **mean of the top-k patch distances**.
+
+- `--topk_patches_noise <int>` (default: `8`)  
+  Number of highest patch distances to average when  
+  `--score_mode_noise=topk_patches`.
+
 ## Blur parameters
 
 These control the **Blur** perturbation:
@@ -67,6 +82,21 @@ These control the **Blur** perturbation:
   - `--perturb both`
   - `--perturb minder`
   - or `--minder_from_csv` combined with a blur CSV.
+ 
+  ### Blur scoring mode
+
+- `--score_mode_blur <str>` (default: `cls`, choices: `cls`, `topk_patches`)  
+  How to compute **blur-based** anomaly scores:
+
+  - `cls`  
+    Cosine distance on **CLS embeddings** (original Contrastive Blur).
+
+  - `topk_patches`  
+    Mean of the **top-k patch-wise distances between blurred and sharpened views**.
+
+- `--topk_patches_blur <int>` (default: `8`)  
+  Number of highest patch distances to average when  
+  `--score_mode_blur=topk_patches`.
 
 ## Perturbation mode (`--perturb`)
 
@@ -96,14 +126,31 @@ These control the **Blur** perturbation:
 
 > Note: `--perturb` is ignored when you use `--minder_from_csv` (CSV-only mode).
 
-## Threshold calibration
+## CSV-only MINDER mode
 
-- `--calibrate_on_same_set` (flag, default: off)  
-  If set, the script will:
-  - compute a threshold at **FPR = 5%** on REAL scores of the current eval set,
-  - print the threshold, FPR and TPR obtained on this same set.  
+These options allow you to build MINDER **only from existing CSVs**, without re-running the model:
 
-This is mainly for inspection / analysis; the threshold is **not** saved into the CSV (only printed).
+- `--minder_from_csv` (flag)  
+  If set, the script:
+  - loads noise scores from `--rigid_csv`
+  - loads blur scores from `--blur_csv`
+  - computes **MINDER = min(noise_distance, blur_distance)** per image
+  - recomputes AUROCs and summary metrics  
+  No images are loaded and no forward passes are performed.
+
+- `--rigid_csv <str>` (default: `results/rigid_scores.csv`)  
+  Path to the CSV with RIGID (noise) scores.
+
+- `--blur_csv <str>` (default: `results/blur_scores.csv`)  
+  Path to the CSV with Contrastive Blur scores.
+
+## Dataset selection
+
+- `--datasets <str ...>` (default: `None`)  
+  Optional list of **dataset tags** to include, e.g.:
+
+  ```bash
+  --datasets ADM CollabDiff
 
 ## Results directory
 

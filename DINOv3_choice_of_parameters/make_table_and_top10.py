@@ -126,7 +126,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--out-dir",
-        default="out_tables",
+        default="results_sweep_dinov3",
         help="Output directory for the generated CSV tables.",
     )
     parser.add_argument(

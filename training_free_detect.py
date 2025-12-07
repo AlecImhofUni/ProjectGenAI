@@ -1,57 +1,79 @@
 #!/usr/bin/env python3
 """
-Training-free detection of AI-generated images with VFMs (DINOv2) — RIGID (Noise), Contrastive Blur, and MINDER.
-Computes global and per-dataset AUROC; writes per-image and summary CSVs to a dedicated 'results/' dir.
+Training-free detection of AI-generated images with Vision Foundation Models
+(DINOv2 / DINOv3) using RIGID (noise), Contrastive Blur, and MINDER.
+
+This script computes global and per-dataset AUROC and writes per-image and
+summary CSVs to a dedicated results directory.
 
 What this script does
 ---------------------
-- Loads a timm DINOv2 / DINOv3 ViT (B/L/G) as a **feature extractor** (num_classes=0); returns L2-normalized CLS embeddings.
-- Reads images from data_root/{real,fake} and resizes on-the-fly to 224×224 (Resize -> CenterCrop); no disk recompression.
-- Applies **pixel-space perturbations** on [0,1] images, then re-normalizes for the encoder:
-    • **Noise (RIGID)**: add Gaussian noise σ ∈ [0,1] (repeat n_noise, average distance).
-    • **Contrastive Blur**: compare a **blurred** version and a **sharpened** version of the image
-      (Gaussian blur with σ_blur in pixels, then contrastive sharpening: x_sharp = clamp(2·x - x_blur)).
-    • **MINDER**: per-image **min** between Noise and Contrastive Blur scores
-      (either computed in-memory or from CSVs).
-- Scores each image by **cosine distance**: 1 − cos(embedding_clean, embedding_perturbed) (or between blur vs sharp).
-  Higher score ⇒ more sensitive ⇒ more likely **fake**.
-- Reports **GLOBAL** AUROC and **per-dataset** AUROC (dataset parsed from filename or CSV tag).
-- Exports per-image CSVs (path, label, score, dataset) and summary CSVs (GLOBAL + per-dataset AUROC).
+- Loads a timm DINOv2 (S/L/G) / DINOv3 (S/L) ViT  as a feature extractor
+  (num_classes=0) and returns L2-normalized embeddings (CLS and/or patches).
+- Reads images from data_root/{real,fake} and resizes them on the fly to
+  224×224 (Resize -> CenterCrop); no disk recompression is performed.
+- Applies pixel-space perturbations on [0, 1] images, then re-normalizes
+  them for the encoder:
+    - Noise (RIGID): add Gaussian noise with standard deviation sigma in
+      [0, 1] (repeat n_noise times and average distances).
+    - Contrastive Blur: compare a blurred version and a sharpened version
+      of the image (Gaussian blur with standard deviation sigma_blur in
+      pixels at 224×224, then contrastive sharpening:
+      x_sharp = clamp(2·x - x_blur)).
+    - MINDER: per-image minimum between Noise and Contrastive Blur scores,
+      either computed in-memory or from previously saved CSVs.
+- Scores each image by cosine distance:
+    - For noise: 1 − cos(embedding_clean, embedding_noisy).
+    - For blur: 1 − cos(embedding_blur, embedding_sharp).
+  Higher scores correspond to more perturbation-sensitive images, which are
+  more likely to be fake.
+- Supports different scoring modes, such as CLS-based scoring and
+  patch-wise top-k aggregation.
+- Reports global AUROC and per-dataset AUROC (dataset labels are provided
+  by the dataset loader and propagated through the CSVs).
+- Exports per-image CSVs (path, label, score, dataset) and summary CSVs
+  (global and per-dataset AUROC, plus hyperparameters).
 
 Folder layout (expected)
 ------------------------
   data_root/
-    real/  <images...>
-    fake/  <images...>
-  # Filenames or an index CSV should carry/encode the dataset tag (e.g., ADM, CollabDiff).
+    real/    <images...>
+    fake/    <images...>
+  Filenames or an index CSV should carry/encode the dataset tag
+  (e.g., ADM, CollabDiff, SID) so that per-dataset AUROC can be computed.
 
 Outputs (CSV)
 -------------
   results/
-    rigid_scores.csv    | per-image (Noise) : path,label,score,dataset
-    rigid_summary.csv   | GLOBAL + per-dataset AUROC (+ hyperparams)
-    blur_scores.csv     | per-image (Contrastive Blur)
-    blur_summary.csv    | summary (Contrastive Blur)
-    minder_scores.csv   | per-image (MINDER = min(Noise, Blur) distance)
-    minder_summary.csv  | summary (MINDER)
+    rigid_scores.csv    # per-image (Noise): path,label,score,dataset
+    rigid_summary.csv   # summary: global + per-dataset AUROC (+ hyperparams)
+    blur_scores.csv     # per-image (Contrastive Blur)
+    blur_summary.csv    # summary (Contrastive Blur)
+    minder_scores.csv   # per-image (MINDER = min(Noise, Blur) distance)
+    minder_summary.csv  # summary (MINDER)
 
 Key CLI flags
 -------------
   --perturb {noise,blur,both,minder}
-      noise  : compute Noise only
-      blur   : compute Contrastive Blur only
-      both   : compute Noise, then Blur, then MINDER in the same run
-      minder : compute Noise+Blur in-memory and export MINDER only
-  --sigma <float>         Gaussian **noise** std in pixel units [0,1]  (e.g., 0.009)
+      noise   : compute Noise only
+      blur    : compute Contrastive Blur only
+      both    : compute Noise, then Blur, then MINDER in the same run
+      minder  : compute Noise + Blur in-memory and export MINDER only
+
+  --sigma <float>         Gaussian noise standard deviation in pixel units
+                          [0, 1] (e.g., 0.009)
   --n_noise <int>         Number of noise samples to average (e.g., 3)
-  --sigma_blur <float>    Gaussian **blur** std in **pixels** at 224×224 (e.g., 1.6)
+  --sigma_blur <float>    Gaussian blur standard deviation in pixels at
+                          224×224 (e.g., 1.6)
 
 CSV-only (no recompute) mode
 ----------------------------
-  --minder_from_csv                 Merge existing per-image CSVs and compute MINDER only
-  --rigid_csv <path>                Path to Noise (rigid_scores.csv)
-  --blur_csv  <path>                Path to Blur  (blur_scores.csv)
-  # In this mode, --data_root/--model are ignored.
+  --minder_from_csv       Merge existing per-image CSVs and compute MINDER only
+  --rigid_csv <path>      Path to Noise CSV (rigid_scores.csv)
+  --blur_csv  <path>      Path to Blur CSV  (blur_scores.csv)
+
+  In this mode, --data_root and --model are ignored; the script only reads
+  scores from the provided CSVs and computes MINDER + summary AUROCs.
 
 Dependencies
 ------------
@@ -60,19 +82,9 @@ Dependencies
 
 Typical runs
 ------------
-  # Noise (RIGID)
+  # Example: compute Noise, Blur, and MINDER with DINOv2-L on a pairs dataset
   python training_free_detect.py \
-    --data_root ~/data/pairs_1000_eval \
-    --model dinov2-l14 \
-    --batch_size 64 \
-    --sigma 0.009 --n_noise 3 \
-    --perturb noise \
-    --score_mode_noise topk_patches \
-    --topk_patches_noise 8 \
-    --results_dir results_topk
-
-  python training_free_detect.py \
-    --data_root ~/data/pairs_1000_eval \
+    --data_root /path/to/pairs_eval \
     --model dinov2-l14 \
     --batch_size 64 \
     --sigma 0.009 --n_noise 3 \
@@ -80,9 +92,8 @@ Typical runs
     --perturb both \
     --score_mode_noise topk_patches \
     --topk_patches_noise 8 \
-    --score_mode_blur topk_patches \
-    --topk_patches_blur 8 \
-    --results_dir results_topk
+    --score_mode_blur cls \
+    --results_dir results
 """
 
 import argparse

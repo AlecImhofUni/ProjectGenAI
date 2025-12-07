@@ -45,7 +45,6 @@ Key CLI flags
   --sigma <float>         Gaussian **noise** std in pixel units [0,1]  (e.g., 0.009)
   --n_noise <int>         Number of noise samples to average (e.g., 3)
   --sigma_blur <float>    Gaussian **blur** std in **pixels** at 224×224 (e.g., 1.6)
-  --calibrate_on_same_set Calibrate thr@FPR=5% on REALs from this eval set (optimistic; for inspection)
 
 CSV-only (no recompute) mode
 ----------------------------
@@ -54,6 +53,36 @@ CSV-only (no recompute) mode
   --blur_csv  <path>                Path to Blur  (blur_scores.csv)
   # In this mode, --data_root/--model are ignored.
 
+Dependencies
+------------
+  pip install timm torch torchvision scikit-learn pillow
+  (pandas is optional; a CSV fallback is used if pandas is missing)
+
+Typical runs
+------------
+  # Noise (RIGID)
+  python training_free_detect.py \
+    --data_root ~/data/pairs_1000_eval \
+    --model dinov2-l14 \
+    --batch_size 64 \
+    --sigma 0.009 --n_noise 3 \
+    --perturb noise \
+    --score_mode_noise topk_patches \
+    --topk_patches_noise 8 \
+    --results_dir results_topk
+
+  python training_free_detect.py \
+    --data_root ~/data/pairs_1000_eval \
+    --model dinov2-l14 \
+    --batch_size 64 \
+    --sigma 0.009 --n_noise 3 \
+    --sigma_blur 0.55 \
+    --perturb both \
+    --score_mode_noise topk_patches \
+    --topk_patches_noise 8 \
+    --score_mode_blur topk_patches \
+    --topk_patches_blur 8 \
+    --results_dir results_topk
 """
 
 import argparse
@@ -317,6 +346,49 @@ def embed_cls(model, x: torch.Tensor) -> torch.Tensor:
     cls = F.normalize(cls, dim=-1)
     return cls
 
+
+@torch.no_grad()
+def embed_patches(model, x: torch.Tensor) -> torch.Tensor:
+    """
+    Extract L2-normalized **patch** embeddings (shape [B, N, D]) from a timm ViT.
+
+    Unlike `embed_cls`, which returns a single global vector per image (the CLS token),
+    this function returns one embedding per patch, preserving spatial structure.
+
+    Args:
+        model (torch.nn.Module): ViT backbone from timm (num_classes=0).
+        x (torch.Tensor): Input batch tensor [B, 3, H, W] already normalized.
+
+    Returns:
+        torch.Tensor: L2-normalized patch embeddings [B, N, D],
+                      where N is the number of image patches (e.g. 196 for 14x14).
+    """
+    feats = model.forward_features(x)
+
+    # timm models may return dictionaries or tensors depending on the backbone
+    if isinstance(feats, dict):
+        if "x_norm" in feats:
+            # Typical DINOv2 / ViT feature map: [B, N+1, D] (CLS + patches)
+            tokens = feats["x_norm"]
+        else:
+            # Fallback: take the first tensor value
+            first_tensor = next(v for v in feats.values() if torch.is_tensor(v))
+            tokens = first_tensor
+    else:
+        # Typical ViT output: [B, N+1, D] with CLS token at position 0
+        tokens = feats
+
+    # Drop CLS token (index 0) → keep only patch tokens: [B, N, D]
+    if tokens.dim() >= 3 and tokens.size(1) >= 2:
+        patches = tokens[:, 1:, :]
+    else:
+        # Degenerate case: no separate CLS dimension; treat all as "patches"
+        patches = tokens
+
+    # L2-normalize along the embedding dimension for cosine distance
+    patches = F.normalize(patches, dim=-1)
+    return patches
+
 # ------------------ Pixel-space perturbations ------------------
 
 def _mean_std(device: str, dtype: torch.dtype):
@@ -533,6 +605,108 @@ def score_loader(model, loader: DataLoader, sigma: float = 0.009, n_noise: int =
     labels = torch.cat(all_labels)
     return scores, labels, all_paths, all_dsets
 
+
+@torch.no_grad()
+def score_loader_noise_topk(
+    model,
+    loader: DataLoader,
+    sigma: float = 0.009,
+    n_noise: int = 3,
+    topk: int = 8,
+    device: str = "cuda",
+    allowed_datasets=None,
+):
+    """
+    Compute patch-wise RIGID-style scores with Gaussian noise, using a **top-k** strategy.
+
+    For each batch:
+      - patches_clean = patch embeddings of the clean image [B, N, D].
+      - For n_noise times:
+          * Add Gaussian noise in pixel space.
+          * Re-normalize and compute patch embeddings → patches_pert [B, N, D].
+          * Compute per-patch cosine distances d_patches = 1 - cos(p_clean, p_pert) [B, N].
+      - Average d_patches over n_noise → d_mean [B, N].
+      - For each image, sort d_mean descending along N, take the top-k values,
+        and average them → final score [B].
+
+    Args:
+        model (torch.nn.Module): ViT backbone (timm).
+        loader (DataLoader): DataLoader over RealFakeFolder.
+        sigma (float): Noise std in pixel units [0,1].
+        n_noise (int): Number of independent noise samples to average.
+        topk (int): Number of highest patch distances to average per image.
+        device (str): Device on which to run the model ("cuda" or "cpu").
+        allowed_datasets (set[str] | None): If provided, only keep samples from these datasets.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, list[str], list[str]]:
+            - scores: 1D tensor [N] of scores (higher = more unstable).
+            - labels: 1D tensor [N] (0 = real, 1 = fake).
+            - paths: List of file paths (str).
+            - datasets: List of dataset tags (str).
+    """
+    mean, std = _mean_std(device, torch.float32)
+    allowed_set = None
+    if allowed_datasets:
+        # case-insensitive match
+        allowed_set = {ds.lower() for ds in allowed_datasets}
+
+    all_scores, all_labels, all_paths, all_dsets = [], [], [], []
+    for x, y, paths, dsets in loader:
+        # Filter batch by dataset if needed (same logic as score_loader)
+        if allowed_set is not None:
+            mask = [ds.lower() in allowed_set for ds in dsets]
+            if not any(mask):
+                continue
+            idx = [i for i, keep in enumerate(mask) if keep]
+            x = x[idx]
+            y = y[idx]
+            paths = [paths[i] for i in idx]
+            dsets = [dsets[i] for i in idx]
+
+        x = x.to(device, non_blocking=True)
+
+        # Patch embeddings of the clean image: [B, N, D]
+        patches_clean = embed_patches(model, x)
+
+        per_noise_dists = []
+        for _ in range(n_noise):
+            # Perturb in pixel space and re-embed patches
+            x_pert = add_gaussian_noise_pixel(x, sigma, mean, std)
+            patches_pert = embed_patches(model, x_pert)  # [B, N, D]
+
+            # Per-patch cosine distance (embeddings are L2-normalized)
+            # Result: [B, N]
+            d_patches = 1.0 - torch.sum(patches_clean * patches_pert, dim=-1)
+            per_noise_dists.append(d_patches)
+
+        # Average per-patch distances across noise samples: [B, N]
+        d_patches_mean = torch.stack(per_noise_dists, dim=0).mean(dim=0)
+
+        # For each image, take the top-k patch distances and average them: [B]
+        # Sort along N dimension in descending order
+        d_sorted, _ = torch.sort(d_patches_mean, dim=-1, descending=True)
+
+        # In case topk > N, clamp k to N
+        k = min(topk, d_sorted.shape[-1])
+        scores_batch = d_sorted[:, :k].mean(dim=-1)  # [B]
+
+        all_scores.append(scores_batch.cpu())
+        all_labels.append(y)
+        all_paths.extend(paths)
+        all_dsets.extend(dsets)
+
+    if not all_scores:
+        raise RuntimeError(
+            "No samples left after applying dataset filter "
+            f"(allowed={allowed_datasets})."
+        )
+
+    scores = torch.cat(all_scores)
+    labels = torch.cat(all_labels)
+    return scores, labels, all_paths, all_dsets
+
+
 @torch.no_grad()
 def score_loader_blur(model, loader: DataLoader, sigma_blur: float = 0.55, device: str = "cuda", allowed_datasets=None):
     """
@@ -614,6 +788,99 @@ def score_loader_blur(model, loader: DataLoader, sigma_blur: float = 0.55, devic
     labels = torch.cat(all_labels)
     return scores, labels, all_paths, all_dsets
 
+
+@torch.no_grad()
+def score_loader_blur_topk(
+    model,
+    loader: DataLoader,
+    sigma_blur: float = 0.55,
+    topk: int = 8,
+    device: str = "cuda",
+    allowed_datasets=None,
+):
+    """
+    Compute patch-wise scores for Contrastive Blur using a **top-k** strategy.
+
+    For each batch:
+      - Build blurred (x_blur) and sharpened (x_sharp) views in pixel space,
+        then normalize them.
+      - Compute patch embeddings for both views: [B, N, D].
+      - Compute per-patch cosine distances d_patches = 1 - cos(p_blur, p_sharp) [B, N].
+      - For each image, take the top-k patch distances and average them → [B].
+
+    Args:
+        model (torch.nn.Module): ViT backbone (timm, num_classes=0).
+        loader (DataLoader): DataLoader over RealFakeFolder.
+        sigma_blur (float): Gaussian blur std in pixel units (e.g. 0.55).
+        topk (int): Number of highest patch distances to average per image.
+        device (str): "cuda" or "cpu".
+        allowed_datasets (set[str] | None): If provided, only keep samples from these datasets.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, list[str], list[str]]:
+            - scores: 1D tensor [N] of scores (higher = more unstable).
+            - labels: 1D tensor [N] (0 = real, 1 = fake).
+            - paths: List of file paths (str).
+            - datasets: List of dataset tags (str).
+    """
+    mean, std = _mean_std(device, torch.float32)
+    allowed_set = None
+    if allowed_datasets:
+        # case-insensitive match
+        allowed_set = {ds.lower() for ds in allowed_datasets}
+
+    all_scores, all_labels, all_paths, all_dsets = [], [], [], []
+    for x, y, paths, dsets in loader:
+        # Filter batch by dataset if needed (same logic as other scorers)
+        if allowed_set is not None:
+            mask = [ds.lower() in allowed_set for ds in dsets]
+            if not any(mask):
+                continue
+            idx = [i for i, keep in enumerate(mask) if keep]
+            x = x[idx]
+            y = y[idx]
+            paths = [paths[i] for i in idx]
+            dsets = [dsets[i] for i in idx]
+
+        x = x.to(device, non_blocking=True)
+
+        # Convert to [0,1] for blur/sharpen operations
+        x_pix = denorm(x, mean, std)
+        x_blur = gaussian_blur_pixel(x, sigma_blur, mean, std)
+
+        x_sharp_pix = torch.clamp(2.0 * x_pix - denorm(x_blur, mean, std), 0.0, 1.0)
+        x_sharp = renorm(x_sharp_pix, mean, std)
+
+        # === Patch embeddings for blurred and sharpened images ===
+        patches_blur = embed_patches(model, x_blur)     # [B, N, D]
+        patches_sharp = embed_patches(model, x_sharp)   # [B, N, D]
+
+        # Per-patch cosine distance (embeddings are L2-normalized): [B, N]
+        d_patches = 1.0 - torch.sum(patches_blur * patches_sharp, dim=-1)
+
+        # Sort per image along patch dimension (N), descending
+        d_sorted, _ = torch.sort(d_patches, dim=-1, descending=True)
+
+        # Clamp k in case topk > number of patches
+        k = min(topk, d_sorted.shape[-1])
+        scores_batch = d_sorted[:, :k].mean(dim=-1)  # [B]
+
+        all_scores.append(scores_batch.cpu())
+        all_labels.append(y)
+        all_paths.extend(paths)
+        all_dsets.extend(dsets)
+
+    if not all_scores:
+        raise RuntimeError(
+            "No samples left after applying dataset filter "
+            f"(allowed={allowed_datasets})."
+        )
+
+    scores = torch.cat(all_scores)
+    labels = torch.cat(all_labels)
+    return scores, labels, all_paths, all_dsets
+
+
 def auroc(scores: torch.Tensor, labels: torch.Tensor) -> float:
     """
     Compute AUROC with sklearn.
@@ -658,32 +925,6 @@ def per_dataset_auroc(scores: torch.Tensor, labels: torch.Tensor, datasets: list
         else:
             results[ds] = (float(roc_auc_score(y.numpy(), s.numpy())), len(idxs))
     return results
-
-def threshold_at_fpr(real_scores, target_fpr: float = 0.05) -> float:
-    """
-    Choose a threshold such that FPR ≈ target_fpr on REAL scores.
-
-    Implementation:
-      - Sort REAL scores ascending.
-      - Keep (1 - target_fpr) quantile as threshold.
-      - Under the assumption that fake scores are larger, this yields the
-        desired false positive rate for a rule "score >= thr means fake".
-
-    Args:
-        real_scores (torch.Tensor | list[float] | numpy.ndarray): Scores for real images.
-        target_fpr (float): Desired false positive rate (0..1).
-
-    Returns:
-        float: Threshold value on the score.
-    """
-    real_scores = torch.as_tensor(real_scores)
-    if real_scores.numel() == 0:
-        return float("nan")
-    real_sorted = torch.sort(real_scores).values
-    n = len(real_sorted)
-    q = max(0.0, min(1.0, 1.0 - target_fpr))
-    k = int(math.floor(q * (n - 1))) if n > 1 else 0
-    return float(real_sorted[k])
 
 # ------------------ CSV Export Helpers ------------------
 
@@ -817,12 +1058,26 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--n_noise", default=3, type=int,
                     help="How many noise samples to average")
     
+    # Noise scoring mode (CLS vs patch-wise top-k)
+    ap.add_argument(
+        "--score_mode_noise",
+        default="cls",
+        choices=["cls", "topk_patches"],
+        help=(
+            "How to compute noise scores: "
+            "'cls' = cosine distance on CLS embeddings (original RIGID), "
+            "'topk_patches' = mean of top-k patch-wise distances."
+        ),
+    )
+    ap.add_argument(
+        "--topk_patches_noise",
+        default=8,
+        type=int,
+        help="Number of highest patch distances to average when --score_mode_noise=topk_patches.",
+    )
+
     # Device
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", type=str)
-    
-    # Threshold calibration
-    ap.add_argument("--calibrate_on_same_set", action="store_true",
-                    help="Calibrate threshold@FPR=5% on the SAME REAL set (optimistic).")
     
     # Output directory
     ap.add_argument("--results_dir", default="results", type=str,
@@ -831,7 +1086,29 @@ def parse_args() -> argparse.Namespace:
     # Blur hyperparameters
     ap.add_argument("--sigma_blur", default=0.55, type=float,
                     help="Gaussian blur σ (fixed 3×3 kernel in pixel space; default 0.55).")    
-    
+
+    # Blur scoring mode (CLS vs patch-wise top-k)
+    ap.add_argument(
+        "--score_mode_blur",
+        default="cls",
+        choices=["cls", "topk_patches"],
+        help=(
+            "How to compute blur scores: "
+            "'cls' = cosine distance on CLS embeddings (original Contrastive Blur), "
+            "'topk_patches' = mean of top-k patch-wise distances between "
+            "blurred and sharpened views."
+        ),
+    )
+    ap.add_argument(
+        "--topk_patches_blur",
+        default=8,
+        type=int,
+        help=(
+            "Number of highest patch distances to average when "
+            "--score_mode_blur=topk_patches."
+        ),
+    )
+
     # Perturbation mode
     ap.add_argument("--perturb", default="both",
                 choices=["noise", "blur", "both", "minder"],
@@ -847,7 +1124,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--rigid_csv", default="results/rigid_scores.csv", type=str)
     ap.add_argument("--blur_csv",  default="results/blur_scores.csv",  type=str)
 
-    # Dataset selection (optional)
+    # Dataset selection
     ap.add_argument(
         "--datasets",
         nargs="+",
@@ -879,7 +1156,6 @@ def main() -> None:
                 - 'blur' : only contrastive blur.
                 - 'minder': compute noise+blur then MINDER in-memory.
                 - 'both'  : export all three: noise, blur, minder.
-            * Optionally calibrate thr@FPR=5% on REAL scores.
             * Write scores + summary CSVs under results_dir.
 
     Returns:
@@ -951,35 +1227,121 @@ def main() -> None:
     method = args.perturb
     if method == "noise":
         # Noise-only RIGID
-        scores, labels, paths, datasets = score_loader(
-            model, loader, sigma=args.sigma, n_noise=args.n_noise, device=args.device, allowed_datasets=args.datasets
-        )
-        method_print = f"RIGID/Noise (sigma={args.sigma}, n_noise={args.n_noise})"
+        if args.score_mode_noise == "cls":
+            # Original CLS-based RIGID
+            scores, labels, paths, datasets = score_loader(
+                model,
+                loader,
+                sigma=args.sigma,
+                n_noise=args.n_noise,
+                device=args.device,
+                allowed_datasets=args.datasets,
+            )
+            method_print = (
+                f"RIGID/Noise CLS (sigma={args.sigma}, n_noise={args.n_noise})"
+            )
+        else:  # args.score_mode_noise == "topk_patches"
+            # patch-wise top-k scoring
+            scores, labels, paths, datasets = score_loader_noise_topk(
+                model,
+                loader,
+                sigma=args.sigma,
+                n_noise=args.n_noise,
+                topk=args.topk_patches_noise,
+                device=args.device,
+                allowed_datasets=args.datasets,
+            )
+            method_print = (
+                f"RIGID/Noise top-{args.topk_patches_noise} patches "
+                f"(sigma={args.sigma}, n_noise={args.n_noise})"
+            )
 
     elif method == "blur":
         # Contrastive blur-only
-        scores, labels, paths, datasets = score_loader_blur(
-            model, loader, sigma_blur=args.sigma_blur, device=args.device, allowed_datasets=args.datasets
-        )
-        method_print = f"Blur (sigma_blur={args.sigma_blur})"
+        if args.score_mode_blur == "cls":
+            # Original CLS-based Contrastive Blur
+            scores, labels, paths, datasets = score_loader_blur(
+                model,
+                loader,
+                sigma_blur=args.sigma_blur,
+                device=args.device,
+                allowed_datasets=args.datasets,
+            )
+            method_print = f"Blur CLS (sigma_blur={args.sigma_blur})"
+        else:  # args.score_mode_blur == "topk_patches"
+            # Patch-wise top-k Contrastive Blur
+            scores, labels, paths, datasets = score_loader_blur_topk(
+                model,
+                loader,
+                sigma_blur=args.sigma_blur,
+                topk=args.topk_patches_blur,
+                device=args.device,
+                allowed_datasets=args.datasets,
+            )
+            method_print = (
+                f"Blur top-{args.topk_patches_blur} patches "
+                f"(sigma_blur={args.sigma_blur})"
+            )
 
     elif method == "minder":
         # Compute noise and blur scores (same alignment/order) then combine
 
-        # Noise scores
-        scores_n, labels, paths, datasets = score_loader(
-            model, loader, sigma=args.sigma, n_noise=args.n_noise, device=args.device, allowed_datasets=args.datasets
-        )
-        # Blur scores
-        scores_b, _, _, _ = score_loader_blur(
-            model, loader, sigma_blur=args.sigma_blur, device=args.device, allowed_datasets=args.datasets
-        )
+        # ----- Noise scores (respect --score_mode_noise) -----
+        if args.score_mode_noise == "cls":
+            scores_n, labels, paths, datasets = score_loader(
+                model,
+                loader,
+                sigma=args.sigma,
+                n_noise=args.n_noise,
+                device=args.device,
+                allowed_datasets=args.datasets,
+            )
+            noise_desc = f"Noise CLS (sigma={args.sigma}, n_noise={args.n_noise})"
+        else:  # args.score_mode_noise == "topk_patches"
+            scores_n, labels, paths, datasets = score_loader_noise_topk(
+                model,
+                loader,
+                sigma=args.sigma,
+                n_noise=args.n_noise,
+                topk=args.topk_patches_noise,
+                device=args.device,
+                allowed_datasets=args.datasets,
+            )
+            noise_desc = (
+                f"Noise top-{args.topk_patches_noise} patches "
+                f"(sigma={args.sigma}, n_noise={args.n_noise})"
+            )
+
+        # ----- Blur scores (respect --score_mode_blur) -----
+        if args.score_mode_blur == "cls":
+            scores_b, _, _, _ = score_loader_blur(
+                model,
+                loader,
+                sigma_blur=args.sigma_blur,
+                device=args.device,
+                allowed_datasets=args.datasets,
+            )
+            blur_desc = f"Blur CLS (sigma_blur={args.sigma_blur})"
+        else:  # args.score_mode_blur == "topk_patches"
+            scores_b, _, _, _ = score_loader_blur_topk(
+                model,
+                loader,
+                sigma_blur=args.sigma_blur,
+                topk=args.topk_patches_blur,
+                device=args.device,
+                allowed_datasets=args.datasets,
+            )
+            blur_desc = (
+                f"Blur top-{args.topk_patches_blur} patches "
+                f"(sigma_blur={args.sigma_blur})"
+            )
+
         # MINDER = per-image min(distance) = max(similarity degradation)
         scores = torch.minimum(scores_n, scores_b)
 
         method_print = (
-            f"MINDER (min(noise, blur) distances; "
-            f"sigma={args.sigma}, n_noise={args.n_noise}, sigma_blur={args.sigma_blur})"
+            "MINDER (min(noise, blur) distances; "
+            f"{noise_desc}; {blur_desc})"
         )
 
         # Print metrics (global + per-dataset)
@@ -991,14 +1353,6 @@ def main() -> None:
             roc_str = f"{roc:.4f}" if not (roc != roc) else "NaN"
             print(f"  - {ds:<16} AUROC = {roc_str}  |  n = {n}")
 
-        # Optional threshold on same set (REAL scores only) 
-        if args.calibrate_on_same_set:
-            thr = threshold_at_fpr(scores[labels == 0], target_fpr=0.05)
-            y_pred = (scores >= thr).int()
-            fpr = ((y_pred[labels == 0] == 1).float().mean().item()) if (labels == 0).any() else float("nan")
-            tpr = ((y_pred[labels == 1] == 1).float().mean().item()) if (labels == 1).any() else float("nan")
-            print(f"[RIGID/MINDER] thr@FPR=5% = {thr:.6f} | FPR={fpr:.3f} | TPR={tpr:.3f}")
-
         # Save MINDER CSVs and stop
         _save_csvs(
             results_dir, paths, labels, scores, datasets,
@@ -1007,14 +1361,57 @@ def main() -> None:
         return  # done
 
     else:  # method == "both"
-        # Run noise
-        scores_n, labels, paths, datasets = score_loader(
-            model, loader, sigma=args.sigma, n_noise=args.n_noise, device=args.device, allowed_datasets=args.datasets
-        )
-        # Run blur (re-use labels/paths/datasets from above)
-        scores_b, _, _, _ = score_loader_blur(
-            model, loader, sigma_blur=args.sigma_blur, device=args.device, allowed_datasets=args.datasets
-        )
+        # Run Noise with chosen scoring mode
+        if args.score_mode_noise == "cls":
+            scores_n, labels, paths, datasets = score_loader(
+                model,
+                loader,
+                sigma=args.sigma,
+                n_noise=args.n_noise,
+                device=args.device,
+                allowed_datasets=args.datasets,
+            )
+            noise_desc = (
+                f"Noise CLS (sigma={args.sigma}, n_noise={args.n_noise})"
+            )
+        else:  # args.score_mode_noise == "topk_patches"
+            scores_n, labels, paths, datasets = score_loader_noise_topk(
+                model,
+                loader,
+                sigma=args.sigma,
+                n_noise=args.n_noise,
+                topk=args.topk_patches_noise,
+                device=args.device,
+                allowed_datasets=args.datasets,
+            )
+            noise_desc = (
+                f"Noise top-{args.topk_patches_noise} patches "
+                f"(sigma={args.sigma}, n_noise={args.n_noise})"
+            )
+
+        # Run Blur with chosen scoring mode (re-use labels/paths/datasets alignment)
+        if args.score_mode_blur == "cls":
+            scores_b, _, _, _ = score_loader_blur(
+                model,
+                loader,
+                sigma_blur=args.sigma_blur,
+                device=args.device,
+                allowed_datasets=args.datasets,
+            )
+            blur_desc = f"Blur CLS (sigma_blur={args.sigma_blur})"
+        else:  # args.score_mode_blur == "topk_patches"
+            scores_b, _, _, _ = score_loader_blur_topk(
+                model,
+                loader,
+                sigma_blur=args.sigma_blur,
+                topk=args.topk_patches_blur,
+                device=args.device,
+                allowed_datasets=args.datasets,
+            )
+            blur_desc = (
+                f"Blur top-{args.topk_patches_blur} patches "
+                f"(sigma_blur={args.sigma_blur})"
+            )
 
         # First: NOISE summaries + CSVs
         roc_global = auroc(scores_n, labels)
@@ -1066,15 +1463,6 @@ def main() -> None:
     for ds, (roc, n) in per_ds.items():
         roc_str = f"{roc:.4f}" if not (roc != roc) else "NaN"
         print(f"  - {ds:<16} AUROC = {roc_str}  |  n = {n}")
-
-    # Optional threshold @ FPR=5% (on same set if flag enabled)
-    thr = fpr = tpr = None
-    if args.calibrate_on_same_set:
-        thr = threshold_at_fpr(scores[labels == 0], target_fpr=0.05)
-        y_pred = (scores >= thr).int()
-        fpr = ((y_pred[labels == 0] == 1).float().mean().item()) if (labels == 0).any() else float("nan")
-        tpr = ((y_pred[labels == 1] == 1).float().mean().item()) if (labels == 1).any() else float("nan")
-        print(f"[RIGID] thr@FPR=5% = {thr:.6f} | FPR={fpr:.3f} | TPR={tpr:.3f}")
 
     # Save CSVs for noise/blur
     method_tag = "noise" if method == "noise" else "blur"

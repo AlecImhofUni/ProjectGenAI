@@ -142,6 +142,32 @@ In this mode:
     - prints AUROCs
     - saves `results/minder_scores.csv` and `results/minder_summary.csv`
 
+### Patch-wise top-k scoring (optional)
+
+By default, scores are computed from the CLS token:
+- `--score_mode_noise` defaults to `cls`
+- `--score_mode_blur` defaults to `cls`
+
+So the commands above all use CLS-based scoring unless you explicitly switch to patch-wise scoring.
+
+In addition to CLS-based scores, the script supports patch-wise top-k aggregation:
+- `--score_mode_noise {cls, topk_patches}`
+- `--score_mode_blur  {cls, topk_patches}`
+- `--topk_patches_noise K` and `--topk_patches_blur K` set the value of \(k\).
+
+**Example: Noise with patch-wise top-k (k = 8)**
+Run
+```bash
+python training_free_detect.py \
+  --data_root /path/to/pairs_1000_eval \
+  --perturb noise \
+  --sigma 0.009 \
+  --n_noise 3 \
+  --score_mode_noise topk_patches \
+  --topk_patches_noise 8 \
+  --device cuda
+```
+
 ### Restricting to specific datasets (e.g. exclude SID)
 All modes support an optional --datasets argument to restrict which datasets are included
 in the evaluation. Dataset tags are inferred from filenames/paths and normalized to:

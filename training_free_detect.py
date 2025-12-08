@@ -52,48 +52,6 @@ Outputs (CSV)
     minder_scores.csv   # per-image (MINDER = min(Noise, Blur) distance)
     minder_summary.csv  # summary (MINDER)
 
-Key CLI flags
--------------
-  --perturb {noise,blur,both,minder}
-      noise   : compute Noise only
-      blur    : compute Contrastive Blur only
-      both    : compute Noise, then Blur, then MINDER in the same run
-      minder  : compute Noise + Blur in-memory and export MINDER only
-
-  --sigma <float>         Gaussian noise standard deviation in pixel units
-                          [0, 1] (e.g., 0.009)
-  --n_noise <int>         Number of noise samples to average (e.g., 3)
-  --sigma_blur <float>    Gaussian blur standard deviation in pixels at
-                          224×224 (e.g., 1.6)
-
-CSV-only (no recompute) mode
-----------------------------
-  --minder_from_csv       Merge existing per-image CSVs and compute MINDER only
-  --rigid_csv <path>      Path to Noise CSV (rigid_scores.csv)
-  --blur_csv  <path>      Path to Blur CSV  (blur_scores.csv)
-
-  In this mode, --data_root and --model are ignored; the script only reads
-  scores from the provided CSVs and computes MINDER + summary AUROCs.
-
-Dependencies
-------------
-  pip install timm torch torchvision scikit-learn pillow
-  (pandas is optional; a CSV fallback is used if pandas is missing)
-
-Typical runs
-------------
-  # Example: compute Noise, Blur, and MINDER with DINOv2-L on a pairs dataset
-  python training_free_detect.py \
-    --data_root /path/to/pairs_eval \
-    --model dinov2-l14 \
-    --batch_size 64 \
-    --sigma 0.009 --n_noise 3 \
-    --sigma_blur 0.55 \
-    --perturb both \
-    --score_mode_noise topk_patches \
-    --topk_patches_noise 8 \
-    --score_mode_blur cls \
-    --results_dir results
 """
 
 import argparse

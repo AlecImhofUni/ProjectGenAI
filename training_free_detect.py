@@ -958,8 +958,6 @@ def _save_csvs(results_dir: Path, paths, labels: torch.Tensor, scores: torch.Ten
             "sigma_blur": (float(args.sigma_blur) if method_tag in ("blur","minder")  else ""),
             "n_noise":    (int(args.n_noise)      if method_tag in ("noise","minder") else 1),
         })
-
-    # Prefer pandas if available (nicer CSVs)
     pd.DataFrame(rows_scores).to_csv(out_scores, index=False)
     pd.DataFrame(rows_summary).to_csv(out_summary, index=False)
 
